@@ -62,6 +62,19 @@ before any wasm is installed. If a phase fails the run stops and the page report
 canisters exist but are unfinished, so nothing is silently abandoned — they exist and you
 control them.
 
+## Choosing a subnet
+
+The page has an optional **target subnet** field. Left empty, the cycles ledger places
+canisters wherever it likes. Given a subnet id, every canister in the bundle is pinned
+there — the equivalent of `icp deploy --subnet`.
+
+A **cloud engine** is a single subnet, so deploying to one means naming it; its id is on
+the engine console's Applications page. Note that pinning alone is not enough to deploy to
+an engine: an engine does not take canisters through the cycles ledger, and creation goes
+through the engine operator against a principal the engine has authorized. That path is not
+implemented here yet, so an engine subnet id is currently reported as refusing creation.
+The console's App Center accepts a built `.icp` bundle directly via **Upload a custom app**.
+
 ## Canister discovery
 
 Canister IDs are assigned at deployment time, so a frontend cannot hardcode the backend it

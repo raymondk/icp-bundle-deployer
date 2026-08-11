@@ -21,14 +21,23 @@ const Account = IDL.Record({
   subaccount: IDL.Opt(IDL.Vec(IDL.Nat8)),
 })
 
+const SubnetSelection = IDL.Variant({
+  Subnet: IDL.Record({ subnet: IDL.Principal }),
+  Filter: IDL.Record({ subnet_type: IDL.Opt(IDL.Text) }),
+})
+
+const CmcCreateCanisterArgs = IDL.Record({
+  // Always sent as absent: the manifest's settings are applied afterwards through
+  // the management canister, whose typed client knows every settings field.
+  settings: IDL.Opt(IDL.Null),
+  subnet_selection: IDL.Opt(SubnetSelection),
+})
+
 const CreateCanisterArgs = IDL.Record({
   from_subaccount: IDL.Opt(IDL.Vec(IDL.Nat8)),
   created_at_time: IDL.Opt(IDL.Nat64),
   amount: IDL.Nat,
-  // `creation_args` carries canister settings and subnet selection. We leave it
-  // null and apply the manifest's settings afterwards through the management
-  // canister, whose typed client already knows every settings field.
-  creation_args: IDL.Opt(IDL.Null),
+  creation_args: IDL.Opt(CmcCreateCanisterArgs),
 })
 
 const CreateCanisterSuccess = IDL.Record({
@@ -76,12 +85,17 @@ export type CreateCanisterErrorValue =
   | { FailedToCreate: { fee_block: [] | [bigint]; refund_block: [] | [bigint]; error: string } }
   | { GenericError: { message: string; error_code: bigint } }
 
+type CreationArgs = {
+  settings: []
+  subnet_selection: [] | [{ Subnet: { subnet: Principal } }]
+}
+
 interface CyclesLedgerService {
   create_canister: (args: {
     from_subaccount: []
     created_at_time: []
     amount: bigint
-    creation_args: []
+    creation_args: [] | [CreationArgs]
   }) => Promise<CreateCanisterResult>
   icrc1_balance_of: (account: { owner: Principal; subaccount: [] }) => Promise<bigint>
 }
@@ -95,24 +109,40 @@ function actor(agent: HttpAgent) {
 
 export class CyclesLedgerError extends Error {}
 
-/** Creates a canister funded with `amount` cycles from the caller's balance. */
-export async function createCanister(agent: HttpAgent, amount: bigint): Promise<Principal> {
+/**
+ * Creates a canister funded with `amount` cycles from the caller's balance.
+ *
+ * With no `subnet` the ledger places the canister on a subnet of its choosing.
+ * Naming one pins it — what `icp deploy --subnet` does, and what a deployment aimed
+ * at a single subnet (a cloud engine, say) needs.
+ */
+export async function createCanister(
+  agent: HttpAgent,
+  amount: bigint,
+  subnet?: Principal,
+): Promise<Principal> {
   const result = await actor(agent).create_canister({
     from_subaccount: [],
     created_at_time: [],
     amount,
-    creation_args: [],
+    creation_args: subnet
+      ? [{ settings: [], subnet_selection: [{ Subnet: { subnet } }] }]
+      : [],
   })
 
   if ('Ok' in result) return result.Ok.canister_id
-  throw new CyclesLedgerError(describeError(result.Err, amount))
+  throw new CyclesLedgerError(describeError(result.Err, amount, subnet))
 }
 
 export async function cyclesBalance(agent: HttpAgent, owner: Principal): Promise<bigint> {
   return actor(agent).icrc1_balance_of({ owner, subaccount: [] })
 }
 
-function describeError(error: CreateCanisterErrorValue, requested: bigint): string {
+function describeError(
+  error: CreateCanisterErrorValue,
+  requested: bigint,
+  subnet?: Principal,
+): string {
   if ('InsufficientFunds' in error) {
     return (
       `Not enough cycles: creating this canister needs ${formatCycles(requested)} but the ` +
@@ -121,7 +151,15 @@ function describeError(error: CreateCanisterErrorValue, requested: bigint): stri
     )
   }
   if ('FailedToCreate' in error) {
-    return `The cycles ledger could not create the canister: ${error.FailedToCreate.error}`
+    // A subnet that will not take canisters from the cycles ledger reports the same
+    // error as one that does not exist, and the difference matters: a cloud engine's
+    // subnet is reached through its operator, not through the ledger.
+    const hint = subnet
+      ? ` The target subnet was ${subnet.toText()}. A subnet that exists may still refuse ` +
+        'creation through the cycles ledger — a cloud engine, for one, is deployed to ' +
+        'through its engine operator instead.'
+      : ''
+    return `The cycles ledger could not create the canister: ${error.FailedToCreate.error}${hint}`
   }
   if ('GenericError' in error) {
     return `The cycles ledger rejected the request: ${error.GenericError.message}`

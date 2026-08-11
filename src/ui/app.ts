@@ -6,6 +6,7 @@
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
+import { Principal } from '@icp-sdk/core/principal'
 import { loadBundle, type Bundle } from '../bundle'
 import { deployBundle, formatBytes, type DeployEvent, type DeployResult } from '../deploy'
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from '../ic/auth'
@@ -44,6 +45,13 @@ const SKELETON = `
   </section>
 
   <section class="panel">
+    <label class="field" for="subnet">
+      <span>Target subnet <span class="muted">— optional</span></span>
+      <input type="text" id="subnet" spellcheck="false" autocomplete="off"
+             placeholder="leave empty to let the network choose" />
+      <span class="hint">Pins every canister to one subnet. A cloud engine is a single
+        subnet; its id is on the engine console's Applications page.</span>
+    </label>
     <button id="deploy" class="primary" disabled>Deploy</button>
     <ol class="log" id="log"></ol>
     <div id="result"></div>
@@ -61,6 +69,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const dropzone = select<HTMLElement>(root, '#dropzone')
   const fileInput = select<HTMLInputElement>(root, '#file-input')
   const deployButton = select<HTMLButtonElement>(root, '#deploy')
+  const subnetInput = select<HTMLInputElement>(root, '#subnet')
   const log = select<HTMLOListElement>(root, '#log')
 
   function renderIdentity(): void {
@@ -306,6 +315,19 @@ export function mountApp(root: HTMLElement, network: Network): void {
   deployButton.addEventListener('click', () => {
     const { bundle, agent, network, session } = state
     if (!bundle || !agent || !session) return
+
+    let subnet: Principal | undefined
+    const entered = subnetInput.value.trim()
+    if (entered !== '') {
+      try {
+        subnet = Principal.fromText(entered)
+      } catch {
+        log.replaceChildren()
+        appendLog(`"${entered}" is not a valid subnet id.`, 'error')
+        return
+      }
+    }
+
     void withBusy(async () => {
       log.replaceChildren()
       state.result = await deployBundle({
@@ -313,6 +335,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
         agent,
         network,
         identityPrincipal: session.principal,
+        subnet,
         onEvent: onDeployEvent,
       })
       renderResult()

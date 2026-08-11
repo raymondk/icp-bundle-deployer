@@ -46,6 +46,12 @@ export interface DeployOptions {
   network: Network
   /** Principal the deployment signs as; sync plugins are told who is calling. */
   identityPrincipal: Principal
+  /**
+   * Pin every canister to one subnet, as `icp deploy --subnet` does. Left out, the
+   * cycles ledger places them. A cloud engine is a single subnet, so deploying to
+   * one means naming it here.
+   */
+  subnet?: Principal
   onEvent?: (event: DeployEvent) => void
 }
 
@@ -61,6 +67,7 @@ export async function deployBundle({
   agent,
   network,
   identityPrincipal,
+  subnet,
   onEvent = () => {},
 }: DeployOptions): Promise<DeployResult> {
   const canisters = bundle.manifest.canisters
@@ -79,7 +86,7 @@ export async function deployBundle({
   for (const canister of canisters) {
     onEvent({ type: 'started', name: canister.name })
     try {
-      const canisterId = await createCanister(agent)
+      const canisterId = await createCanister(agent, { subnet })
       created.set(canister.name, canisterId)
       onEvent({ type: 'created', name: canister.name, canisterId })
     } catch (error) {

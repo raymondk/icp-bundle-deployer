@@ -166,6 +166,34 @@ button.primary {
 
 /* Deployment */
 
+.field {
+  display: block;
+  margin-bottom: 1rem;
+}
+.field > span {
+  display: block;
+}
+.field input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0.35rem 0 0.3rem;
+  padding: 0.5em 0.7em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  color: inherit;
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.field .hint {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
 .log {
   margin: 1rem 0 0;
   padding-left: 1.4rem;

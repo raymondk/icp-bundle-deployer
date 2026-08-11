@@ -17,6 +17,12 @@ import * as cyclesLedger from './cycles-ledger'
 /** Matches the default `icp deploy` uses to fund a new canister. */
 export const DEFAULT_CREATION_CYCLES = 2_000_000_000_000n
 
+export interface CreateOptions {
+  cycles?: bigint
+  /** Pin the canister to one subnet. Omitted, the ledger chooses. */
+  subnet?: Principal
+}
+
 /**
  * Creates an empty canister controlled by the caller, paid for from the caller's
  * cycles ledger balance.
@@ -27,9 +33,9 @@ export const DEFAULT_CREATION_CYCLES = 2_000_000_000_000n
  */
 export async function createCanister(
   agent: HttpAgent,
-  cycles: bigint = DEFAULT_CREATION_CYCLES,
+  { cycles = DEFAULT_CREATION_CYCLES, subnet }: CreateOptions = {},
 ): Promise<Principal> {
-  return cyclesLedger.createCanister(agent, cycles)
+  return cyclesLedger.createCanister(agent, cycles, subnet)
 }
 
 export async function applySettings(
