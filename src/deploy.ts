@@ -18,6 +18,7 @@ import type { Bundle, BundleCanister } from './bundle'
 import { applySettings, createCanister } from './ic/create'
 import { installCode } from './ic/install'
 import type { Network } from './ic/network'
+import { resolveSubnet, subnetOf } from './ic/subnet'
 import { runSyncStep } from './sync'
 
 export interface DeployedCanister {
@@ -26,6 +27,7 @@ export interface DeployedCanister {
 }
 
 export type DeployEvent =
+  | { type: 'phase'; message: string }
   | { type: 'started'; name: string }
   | { type: 'created'; name: string; canisterId: Principal }
   | { type: 'progress'; name: string; message: string }
@@ -83,12 +85,28 @@ export async function deployBundle({
   })
 
   // ── Create ────────────────────────────────────────────────────────────────
+  // One subnet for the whole bundle. Resolved once, before anything is created, so
+  // canisters that call each other are not scattered across subnets.
+  let target = await resolveSubnet(agent, subnet)
+  if (target) {
+    onEvent({ type: 'phase', message: `Creating canisters on subnet ${target.toText()}` })
+  }
+
   for (const canister of canisters) {
     onEvent({ type: 'started', name: canister.name })
     try {
-      const canisterId = await createCanister(agent, { subnet })
+      const canisterId = await createCanister(agent, { subnet: target })
       created.set(canister.name, canisterId)
       onEvent({ type: 'created', name: canister.name, canisterId })
+
+      // The network could not name a subnet up front, so anchor to wherever the
+      // first canister landed and keep the rest with it.
+      if (!target) {
+        target = await subnetOf(agent, canisterId)
+        if (target) {
+          onEvent({ type: 'phase', message: `Colocating on subnet ${target.toText()}` })
+        }
+      }
     } catch (error) {
       const message = `Could not create canister "${canister.name}": ${describe(error)}`
       onEvent({ type: 'failed', name: canister.name, message })

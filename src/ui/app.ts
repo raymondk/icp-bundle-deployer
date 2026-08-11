@@ -271,6 +271,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
   function onDeployEvent(event: DeployEvent): void {
     switch (event.type) {
+      case 'phase':
+        appendLog(event.message)
+        break
       case 'started':
         appendLog(`${event.name}: creating canister…`)
         break
