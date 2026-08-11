@@ -7,9 +7,10 @@
  * exists — and refused with a message that says what to fix.
  */
 
-import { readArchive } from '../src/bundle/archive'
-import { parseManifest } from '../src/bundle/manifest'
-import { verifyBundle, sha256Hex } from '../src/bundle/verify'
+import { readArchive } from '../src/lib/bundle/archive'
+import { parseManifest } from '../src/lib/bundle/manifest'
+import { verifyBundle, sha256Hex } from '../src/lib/bundle/verify'
+import { createDeployer, isBundle, loadBundle, type BundleSource } from '../src/lib'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { createTar, gzip, type TarFile } from './support/tar'
 
@@ -361,6 +362,44 @@ test('rejects a tampered sync plugin', async () => {
     ),
   )
   await assertRejects(() => verifyBundle(manifest), /sync plugin/i, 'tampered plugin')
+})
+
+// ── Library surface ─────────────────────────────────────────────────────────
+
+group('library')
+
+test('loads a bundle from every source it accepts', async () => {
+  const bytes = bundle(MINIMAL)
+  const sources: BundleSource[] = [
+    bytes,
+    bytes.buffer.slice(0) as ArrayBuffer,
+    new Blob([bytes as BlobPart]),
+    new File([bytes as BlobPart], 'app.icp'),
+  ]
+  for (const source of sources) {
+    const loaded = await loadBundle(source)
+    assertEqual(loaded.manifest.canisters[0].name, 'app', `loading from ${source.constructor.name}`)
+  }
+})
+
+test('keeps a File name and leaves it off raw bytes', async () => {
+  const bytes = bundle(MINIMAL)
+  assertEqual((await loadBundle(new File([bytes as BlobPart], 'app.icp'))).fileName, 'app.icp', 'file name')
+  assertEqual((await loadBundle(bytes)).fileName, undefined, 'raw bytes have no name')
+})
+
+test('passes an already-loaded bundle straight through', async () => {
+  const loaded = await loadBundle(bundle(MINIMAL))
+  assert((await loadBundle(loaded)) === loaded, 'loading a Bundle should not re-parse it')
+  assert(isBundle(loaded), 'isBundle should recognise a loaded bundle')
+  assert(!isBundle(bundle(MINIMAL)), 'isBundle should reject raw bytes')
+})
+
+test('exposes a deployer bound to an agent', () => {
+  // Constructing must not touch the network; only `deploy` does.
+  const deployer = createDeployer({ agent: {} as never })
+  assertEqual(typeof deployer.deploy, 'function', 'deploy')
+  assertEqual(typeof deployer.load, 'function', 'load')
 })
 
 await run('offline: bundle reading, validation and integrity')

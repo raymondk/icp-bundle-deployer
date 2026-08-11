@@ -8,8 +8,9 @@
  * no `fetchRootKey` on a network where fetching it would be unsafe.
  */
 
-import { HttpAgent, IC_ROOT_KEY, type Identity } from '@icp-sdk/core/agent'
+import { HttpAgent, type Identity } from '@icp-sdk/core/agent'
 import { safeGetCanisterEnv } from '@icp-sdk/core/agent/canister-env'
+import { isMainnetRootKey } from '../lib'
 
 export type NetworkKind = 'mainnet' | 'other'
 
@@ -52,13 +53,7 @@ export async function createAgent(network: Network, identity: Identity): Promise
   })
 }
 
-function isMainnetRootKey(rootKey: Uint8Array): boolean {
-  return bytesToHex(rootKey) === IC_ROOT_KEY.toLowerCase()
-}
 
-function bytesToHex(bytes: Uint8Array): string {
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
-}
 
 export function describeNetwork(network: Network): string {
   return network.kind === 'mainnet' ? 'ICP mainnet' : `test network (${network.host})`

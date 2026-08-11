@@ -35,6 +35,43 @@ networks: []
 environments: []
 ```
 
+## Using it as a library
+
+The deployment logic lives in [`src/lib/`](./src/lib) behind one entry point, with no
+dependency on the page around it. Give it an agent and it does the rest — who to sign
+as, and which network it is on, both come from the agent:
+
+```ts
+import { createDeployer } from './lib'
+
+const deployer = createDeployer({ agent })
+
+// Optional: unpack and verify without deploying, to show what a bundle contains.
+const bundle = await deployer.load(file)
+
+const result = await deployer.deploy(bundle, {
+  subnet,                    // optional; omitted, one is resolved for the bundle
+  onEvent: (e) => console.log(e),
+})
+
+for (const { name, canisterId } of result.deployed) {
+  console.log(name, canisterId.toText())
+}
+```
+
+A bundle can be a `File`, `Blob`, `Uint8Array`, `ArrayBuffer`, or an already-loaded
+`Bundle`, so the same call works from a drop zone or from a file read off disk. A
+subnet may be a `Principal` or its text form.
+
+`deploy` never throws for an unusable bundle or a rejected canister: it returns a
+`DeployResult` carrying `deployed`, `incomplete` — created but unfinished — and
+`error`. Loading throws instead, with `ArchiveError`, `ManifestError` or
+`IntegrityError`, since there is nothing partial to report.
+
+The library runs anywhere an agent does; the e2e suite drives it from Node. Only the
+sync step is browser-shaped, needing WebAssembly JSPI — `supportsJspi()` says whether
+this host has it.
+
 ## What it does
 
 1. **Reads the bundle** — gunzips and unpacks the tar, parses `icp.yaml`, and hashes every
@@ -196,11 +233,13 @@ IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
 
 | Path | Role |
 |---|---|
-| `src/bundle/` | archive reader, manifest parsing and validation, integrity checks |
-| `src/ic/` | network detection, identity, canister creation, wasm install |
-| `src/sync/` | plugin transpilation, the WASI sandbox, the `canister-call` bridge |
-| `src/deploy.ts` | per-canister orchestration with progress events |
-| `src/ui/` | the page |
+| `src/lib/index.ts` | the library's public API — everything below is reached through it |
+| `src/lib/deployer.ts` | `createDeployer`: binds an agent, resolves what the caller left out |
+| `src/lib/bundle/` | archive reader, manifest parsing and validation, integrity checks |
+| `src/lib/ic/` | canister creation, wasm install, subnet resolution, cloud engines |
+| `src/lib/sync/` | plugin transpilation, the WASI sandbox, the `canister-call` bridge |
+| `src/lib/deploy.ts` | phased orchestration with progress events |
+| `src/app/` | the page: network detection, Internet Identity, UI |
 | `test/` | the offline and e2e suites |
 
 ## Deploying to mainnet

@@ -9,7 +9,7 @@
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { sha256Hex } from '../../src/bundle/verify'
+import { sha256Hex } from '../../src/lib/bundle/verify'
 import { createTar, gzip } from './tar'
 
 const RELEASE = 'https://github.com/dfinity/certified-assets/releases/download/v0.3.3'

@@ -7,12 +7,19 @@
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import { Principal } from '@icp-sdk/core/principal'
-import { loadBundle, type Bundle } from '../bundle'
-import { deployBundle, formatBytes, type DeployEvent, type DeployResult } from '../deploy'
-import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from '../ic/auth'
-import { createAgent, describeNetwork, type Network } from '../ic/network'
-import { cyclesBalance, formatCycles } from '../ic/cycles-ledger'
-import { supportsJspi } from '../sync'
+import {
+  createDeployer,
+  cyclesBalance,
+  formatBytes,
+  loadBundle,
+  formatCycles,
+  supportsJspi,
+  type Bundle,
+  type DeployEvent,
+  type DeployResult,
+} from '../lib'
+import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from './auth'
+import { createAgent, describeNetwork, type Network } from './network'
 
 interface State {
   network: Network
@@ -180,7 +187,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
         : ''
 
     bundlePanel.innerHTML = `
-      <p class="loaded">Loaded <strong>${escapeHtml(fileName)}</strong> — ${
+      <p class="loaded">Loaded <strong>${escapeHtml(fileName ?? 'bundle')}</strong> — ${
         manifest.canisters.length
       } canister${manifest.canisters.length === 1 ? '' : 's'}.</p>
       <table class="canisters">
@@ -316,7 +323,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   })
 
   deployButton.addEventListener('click', () => {
-    const { bundle, agent, network, session } = state
+    const { bundle, agent, session } = state
     if (!bundle || !agent || !session) return
 
     let subnet: Principal | undefined
@@ -333,14 +340,8 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
     void withBusy(async () => {
       log.replaceChildren()
-      state.result = await deployBundle({
-        bundle,
-        agent,
-        network,
-        identityPrincipal: session.principal,
-        subnet,
-        onEvent: onDeployEvent,
-      })
+      const deployer = createDeployer({ agent })
+      state.result = await deployer.deploy(bundle, { subnet, onEvent: onDeployEvent })
       renderResult()
     })
   })

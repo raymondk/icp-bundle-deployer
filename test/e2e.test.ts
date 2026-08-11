@@ -10,34 +10,34 @@
 import { execFileSync } from 'node:child_process'
 import { Ed25519KeyIdentity } from '@icp-sdk/core/identity'
 import { Principal } from '@icp-sdk/core/principal'
-import { loadBundle } from '../src/bundle'
-import { deployBundle, type DeployedCanister } from '../src/deploy'
-import { cyclesBalance } from '../src/ic/cycles-ledger'
-import { resolveEngineOperator } from '../src/ic/engine'
-import { createAgent, type Network } from '../src/ic/network'
-import { resolveSubnet, subnetOf } from '../src/ic/subnet'
+import { HttpAgent } from '@icp-sdk/core/agent'
+import {
+  createDeployer,
+  cyclesBalance,
+  resolveEngineOperator,
+  resolveSubnet,
+  subnetOf,
+  type DeployedCanister,
+} from '../src/lib'
 import { fullstackBundle } from './support/fixtures'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 
 const HOST = 'http://localhost:8000'
-const network: Network = { kind: 'other', host: HOST }
 
 // A fresh identity per run, so a failed run never leaves state that hides a bug.
 const identity = Ed25519KeyIdentity.generate()
 const principal = identity.getPrincipal()
-const agent = await createAgent(network, identity)
+const agent = await HttpAgent.create({ host: HOST, identity, shouldFetchRootKey: true })
 
 console.log(`identity: ${principal.toText()}`)
 execFileSync('icp', ['cycles', 'transfer', '20t', principal.toText()], { stdio: 'ignore' })
 
+// The library, used exactly as its README shows.
+const deployer = createDeployer({ agent })
 const fixture = await fullstackBundle()
-const bundle = await loadBundle(new File([fixture.bytes as BlobPart], 'e2e.icp'))
+const bundle = await deployer.load(new File([fixture.bytes as BlobPart], 'e2e.icp'))
 
-const result = await deployBundle({
-  bundle,
-  agent,
-  network,
-  identityPrincipal: principal,
+const result = await deployer.deploy(bundle, {
   onEvent: (event) => {
     if (event.type === 'failed') console.log(`    ! ${event.message}`)
   },

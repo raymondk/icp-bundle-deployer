@@ -15,10 +15,9 @@
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import type { Principal } from '@icp-sdk/core/principal'
 import type { Bundle, BundleCanister } from './bundle'
-import { applySettings, createCanister } from './ic/create'
+import { applySettings, createCanister, DEFAULT_CREATION_CYCLES } from './ic/create'
 import { resolveEngineOperator } from './ic/engine'
 import { installCode } from './ic/install'
-import type { Network } from './ic/network'
 import { resolveSubnet, subnetOf } from './ic/subnet'
 import { runSyncStep } from './sync'
 
@@ -43,18 +42,21 @@ export interface DeployResult {
   error?: string
 }
 
-export interface DeployOptions {
+export interface DeployBundleOptions {
   bundle: Bundle
   agent: HttpAgent
-  network: Network
   /** Principal the deployment signs as; sync plugins are told who is calling. */
   identityPrincipal: Principal
   /**
-   * Pin every canister to one subnet, as `icp deploy --subnet` does. Left out, the
-   * cycles ledger places them. A cloud engine is a single subnet, so deploying to
-   * one means naming it here.
+   * Pin every canister to one subnet, as `icp deploy --subnet` does. Left out, one
+   * is resolved for the whole bundle. A cloud engine is a single subnet, so
+   * deploying to one means naming it here.
    */
   subnet?: Principal
+  /** Cycles used to fund each canister. */
+  cycles?: bigint
+  /** Environment name handed to sync plugins; informational to them. */
+  environment?: string
   onEvent?: (event: DeployEvent) => void
 }
 
@@ -68,11 +70,12 @@ const CANISTER_ID_VARIABLE = 'PUBLIC_CANISTER_ID:'
 export async function deployBundle({
   bundle,
   agent,
-  network,
   identityPrincipal,
   subnet,
+  cycles = DEFAULT_CREATION_CYCLES,
+  environment = 'ic',
   onEvent = () => {},
-}: DeployOptions): Promise<DeployResult> {
+}: DeployBundleOptions): Promise<DeployResult> {
   const canisters = bundle.manifest.canisters
   const created = new Map<string, Principal>()
   const finished: DeployedCanister[] = []
@@ -115,7 +118,7 @@ export async function deployBundle({
   for (const canister of canisters) {
     onEvent({ type: 'started', name: canister.name })
     try {
-      const canisterId = await createCanister(agent, { subnet: target, operator })
+      const canisterId = await createCanister(agent, { subnet: target, operator, cycles })
       created.set(canister.name, canisterId)
       onEvent({ type: 'created', name: canister.name, canisterId })
 
@@ -196,7 +199,7 @@ export async function deployBundle({
           step,
           entries: bundle.entries,
           identityPrincipal,
-          environment: network.kind === 'mainnet' ? 'ic' : 'local',
+          environment,
           onOutput: (line) => onEvent({ type: 'progress', name: canister.name, message: line }),
         })
       }
