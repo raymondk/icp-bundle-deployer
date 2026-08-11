@@ -21,11 +21,17 @@ export interface CreateOptions {
   cycles?: bigint
   /** Pin the canister to one subnet. Omitted, the ledger chooses. */
   subnet?: Principal
+  /**
+   * A cloud engine's operator canister. When set, creation is delegated to it
+   * instead of the cycles ledger, and `subnet` is dropped — an operator only ever
+   * creates on its own subnet.
+   */
+  operator?: Principal
 }
 
 /**
  * Creates an empty canister controlled by the caller, paid for from the caller's
- * cycles ledger balance.
+ * cycles ledger balance — or, on a cloud engine, by its operator.
  *
  * Manifest settings are applied afterwards rather than at creation: that keeps the
  * caller in control through the install, and routes every settings change through
@@ -33,9 +39,11 @@ export interface CreateOptions {
  */
 export async function createCanister(
   agent: HttpAgent,
-  { cycles = DEFAULT_CREATION_CYCLES, subnet }: CreateOptions = {},
+  { cycles = DEFAULT_CREATION_CYCLES, subnet, operator }: CreateOptions = {},
 ): Promise<Principal> {
-  return cyclesLedger.createCanister(agent, cycles, subnet)
+  return operator
+    ? cyclesLedger.createCanister(agent, cycles, { target: operator })
+    : cyclesLedger.createCanister(agent, cycles, { subnet })
 }
 
 export async function applySettings(

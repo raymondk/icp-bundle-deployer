@@ -100,28 +100,32 @@ interface CyclesLedgerService {
   icrc1_balance_of: (account: { owner: Principal; subaccount: [] }) => Promise<bigint>
 }
 
-function actor(agent: HttpAgent) {
-  return Actor.createActor<CyclesLedgerService>(idlFactory, {
-    agent,
-    canisterId: CYCLES_LEDGER_CANISTER_ID,
-  })
+function actor(agent: HttpAgent, canisterId: Principal) {
+  return Actor.createActor<CyclesLedgerService>(idlFactory, { agent, canisterId })
 }
 
 export class CyclesLedgerError extends Error {}
 
-/**
- * Creates a canister funded with `amount` cycles from the caller's balance.
- *
- * With no `subnet` the ledger places the canister on a subnet of its choosing.
- * Naming one pins it — what `icp deploy --subnet` does, and what a deployment aimed
- * at a single subnet (a cloud engine, say) needs.
- */
+export interface CreateCanisterOptions {
+  /**
+   * Pins the canister to one subnet. Left out, the ledger places it. Not meaningful
+   * for an engine operator, which only ever creates on its own subnet.
+   */
+  subnet?: Principal
+  /**
+   * Who performs the creation. Defaults to the cycles ledger; a cloud engine's
+   * operator exposes the same `create_canister`, so it slots in here unchanged.
+   */
+  target?: Principal
+}
+
+/** Creates a canister funded with `amount` cycles from the caller's balance. */
 export async function createCanister(
   agent: HttpAgent,
   amount: bigint,
-  subnet?: Principal,
+  { subnet, target = CYCLES_LEDGER_CANISTER_ID }: CreateCanisterOptions = {},
 ): Promise<Principal> {
-  const result = await actor(agent).create_canister({
+  const result = await actor(agent, target).create_canister({
     from_subaccount: [],
     created_at_time: [],
     amount,
@@ -135,7 +139,7 @@ export async function createCanister(
 }
 
 export async function cyclesBalance(agent: HttpAgent, owner: Principal): Promise<bigint> {
-  return actor(agent).icrc1_balance_of({ owner, subaccount: [] })
+  return actor(agent, CYCLES_LEDGER_CANISTER_ID).icrc1_balance_of({ owner, subaccount: [] })
 }
 
 function describeError(

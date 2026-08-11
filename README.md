@@ -64,16 +64,36 @@ control them.
 
 ## Choosing a subnet
 
-The page has an optional **target subnet** field. Left empty, the cycles ledger places
-canisters wherever it likes. Given a subnet id, every canister in the bundle is pinned
-there — the equivalent of `icp deploy --subnet`.
+A deployment lands on exactly one subnet, resolved once before anything is created, so
+canisters that call each other are never scattered. The optional **target subnet** field
+names it — the equivalent of `icp deploy --subnet`. Left empty, the cycles minting
+canister's default subnets decide, as in icp-cli; on a network with no minting canister
+the run anchors to wherever its first canister lands and keeps the rest with it.
 
-A **cloud engine** is a single subnet, so deploying to one means naming it; its id is on
-the engine console's Applications page. Note that pinning alone is not enough to deploy to
-an engine: an engine does not take canisters through the cycles ledger, and creation goes
-through the engine operator against a principal the engine has authorized. That path is not
-implemented here yet, so an engine subnet id is currently reported as refusing creation.
-The console's App Center accepts a built `.icp` bundle directly via **Upload a custom app**.
+## Cloud engines
+
+A **cloud engine** is a user-owned subnet, and it does not create canisters through the
+cycles ledger — creation is delegated to the subnet's **engine operator**, which the
+engine's administrators authorize callers against. Name the engine's subnet (its id is on
+the console's Applications page) and the deployer follows the same route icp-cli does:
+
+- ask the engine registry (`q6cfj-fyaaa-aaaar-qb77q-cai`) which operator serves that
+  subnet;
+- if one answers, address `create_canister` to the operator instead of the ledger — the
+  two are byte-compatible, so nothing else changes;
+- if the registry is absent or has no operator for the subnet, it is an ordinary subnet
+  and creation goes through the ledger as usual.
+
+The lookup happens *before* the first canister is created, deliberately: once a creation
+has been handed to an operator, a failure may still have produced a canister, so falling
+back afterwards risks creating and paying for a second one.
+
+One thing this cannot do for you: an engine authorizes a **principal**, and the principal
+it knows is the one you sign in to the console with. Internet Identity derives a different
+principal per origin, so a deployer served from its own canister signs as someone the
+engine has not authorized. Aligning them needs the console to list this origin in its
+`/.well-known/ii-alternative-origins`. Failing that, the console's App Center accepts a
+built `.icp` bundle directly via **Upload a custom app**.
 
 ## Canister discovery
 

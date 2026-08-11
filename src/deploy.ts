@@ -16,6 +16,7 @@ import type { HttpAgent } from '@icp-sdk/core/agent'
 import type { Principal } from '@icp-sdk/core/principal'
 import type { Bundle, BundleCanister } from './bundle'
 import { applySettings, createCanister } from './ic/create'
+import { resolveEngineOperator } from './ic/engine'
 import { installCode } from './ic/install'
 import type { Network } from './ic/network'
 import { resolveSubnet, subnetOf } from './ic/subnet'
@@ -88,19 +89,40 @@ export async function deployBundle({
   // One subnet for the whole bundle. Resolved once, before anything is created, so
   // canisters that call each other are not scattered across subnets.
   let target = await resolveSubnet(agent, subnet)
+  let operator: Principal | undefined
+
   if (target) {
-    onEvent({ type: 'phase', message: `Creating canisters on subnet ${target.toText()}` })
+    // A cloud engine creates through its own operator rather than the cycles
+    // ledger. Resolved before the first creation, deliberately: once a create has
+    // been handed to an operator, a failure may still have produced a canister, so
+    // falling back afterwards risks creating — and paying for — a second one.
+    try {
+      operator = await resolveEngineOperator(agent, target)
+    } catch (error) {
+      const message = describe(error)
+      onEvent({ type: 'failed', name: canisters[0]?.name ?? '', message })
+      return outcome(message)
+    }
+
+    onEvent({
+      type: 'phase',
+      message: operator
+        ? `Subnet ${target.toText()} is a cloud engine; creating through its operator ${operator.toText()}`
+        : `Creating canisters on subnet ${target.toText()}`,
+    })
   }
 
   for (const canister of canisters) {
     onEvent({ type: 'started', name: canister.name })
     try {
-      const canisterId = await createCanister(agent, { subnet: target })
+      const canisterId = await createCanister(agent, { subnet: target, operator })
       created.set(canister.name, canisterId)
       onEvent({ type: 'created', name: canister.name, canisterId })
 
       // The network could not name a subnet up front, so anchor to wherever the
-      // first canister landed and keep the rest with it.
+      // first canister landed and keep the rest with it. No operator lookup here:
+      // without a subnet there was nothing to look one up for, and an engine is
+      // always reached through an explicitly chosen subnet.
       if (!target) {
         target = await subnetOf(agent, canisterId)
         if (target) {
