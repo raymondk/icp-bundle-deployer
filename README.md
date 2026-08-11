@@ -43,10 +43,12 @@ environments: []
 2. **Targets the network that serves it** — the asset canister hosting this page certifies
    an `ic_env` cookie carrying its network's root key. That key both verifies responses and
    distinguishes mainnet from a test network, so no network has to be chosen by hand.
-3. **Creates every canister** — funded with 2T cycles, the same default `icp deploy` uses.
-   On mainnet that goes through the cycles ledger, charged to the signed-in principal's
-   balance; an ingress message cannot carry cycles, so this is the only client-side path.
-   On a test network it uses free provisional creation.
+3. **Creates every canister** — through the cycles ledger, funded with 2T cycles, the same
+   default `icp deploy` uses. An ingress message cannot carry cycles, so the management
+   canister's `create_canister` is out of reach from a browser; the cycles ledger is a
+   canister like any other, and icp-cli deploys it on local networks at the same
+   well-known address it has on mainnet. One path on every network, so a local deployment
+   exercises exactly what mainnet will do.
 4. **Injects the canister IDs** — see below.
 5. **Installs each wasm** — in one `install_code` call, or through the chunk store for wasms
    above the ingress limit.
@@ -119,14 +121,20 @@ icp deploy
 # open the printed frontend URL, e.g. http://frontend.local.localhost:8000/
 ```
 
-On a test network, choose **Use a temporary identity** — creation is free and needs no
-passkey. On mainnet, sign in with Internet Identity; the principal you sign in as needs a
-cycles ledger balance.
+Sign in with Internet Identity, or on a test network choose **Use a temporary identity** to
+skip the passkey. Either way the principal pays for what it creates, so fund it first —
+locally that is one command:
 
-Note that the deployer must be opened from its canister URL, not the Vite dev server: it
-learns the network's root key from the asset canister's cookie, and the canister to route
-creation through from the gateway's `x-ic-canister-id` header. `npm run dev` is fine for
-working on the page itself, but deploying from it is refused with that explanation.
+```bash
+icp cycles transfer 10t <the principal the page shows>
+```
+
+Deploying with too small a balance fails before anything is created, reporting the
+shortfall.
+
+Open the deployer from its canister URL rather than the Vite dev server: it learns the
+network's root key from the asset canister's `ic_env` cookie, which the dev server does not
+serve. `npm run dev` is fine for working on the page itself.
 
 For the same reason, [`icp.yaml`](./icp.yaml) pins `@dfinity/static-site` at `v0.3.3` or
 later — earlier releases do not serve the `ic_env` cookie that network detection reads.
@@ -147,6 +155,6 @@ later — earlier releases do not serve the `ic_env` cookie that network detecti
 icp deploy -e ic
 ```
 
-Sign in with Internet Identity, then check the cycles balance shown in the identity panel.
-Creation is charged to that principal's cycles ledger account, and a balance too low for
-the 2T funding fails with the shortfall and the principal to top up.
+Sign in with Internet Identity. Nothing else differs — creation is charged to that
+principal's cycles ledger account exactly as it is locally, so the only thing to check is
+that the balance shown in the identity panel covers 2T per canister.

@@ -79,7 +79,7 @@ export async function deployBundle({
   for (const canister of canisters) {
     onEvent({ type: 'started', name: canister.name })
     try {
-      const canisterId = await createCanister(agent, network)
+      const canisterId = await createCanister(agent)
       created.set(canister.name, canisterId)
       onEvent({ type: 'created', name: canister.name, canisterId })
     } catch (error) {

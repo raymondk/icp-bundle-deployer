@@ -75,9 +75,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
           session.source === 'internet-identity' ? 'Internet Identity' : 'a temporary browser key',
         ),
       )
-      if (network.kind === 'mainnet') {
-        rows.push(row('Cycles', balance === undefined ? 'checking…' : escapeHtml(formatCycles(balance))))
-      }
+      // Creation is paid for from the cycles ledger on every network, so the balance
+      // matters everywhere — not just on mainnet.
+      rows.push(row('Cycles', balance === undefined ? 'checking…' : escapeHtml(formatCycles(balance))))
     }
 
     const actions = session
@@ -114,15 +114,13 @@ export function mountApp(root: HTMLElement, network: Network): void {
     renderIdentity()
     renderDeployButton()
 
-    if (state.network.kind === 'mainnet') {
-      // Informational only — a failure here must not block deploying.
-      try {
-        state.balance = await cyclesBalance(state.agent, session.principal)
-      } catch {
-        state.balance = 0n
-      }
-      renderIdentity()
+    // Informational only — a failure here must not block deploying.
+    try {
+      state.balance = await cyclesBalance(state.agent, session.principal)
+    } catch {
+      state.balance = 0n
     }
+    renderIdentity()
   }
 
   function renderBundle(): void {

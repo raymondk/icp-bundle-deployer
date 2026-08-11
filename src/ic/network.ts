@@ -10,30 +10,22 @@
 
 import { HttpAgent, IC_ROOT_KEY, type Identity } from '@icp-sdk/core/agent'
 import { safeGetCanisterEnv } from '@icp-sdk/core/agent/canister-env'
-import { Principal } from '@icp-sdk/core/principal'
 
 export type NetworkKind = 'mainnet' | 'other'
 
 export interface Network {
+  /** Only affects how the network is described and labelled, never how it is used. */
   kind: NetworkKind
   /** Base URL for the agent's `/api/v2` calls. */
   host: string
   /** Root key of the serving network, or `undefined` when it has to be fetched. */
   rootKey?: Uint8Array
-  /**
-   * The canister serving this page, as reported by the HTTP gateway. Off mainnet it
-   * is the effective canister id for provisional creation — see `./provisional`.
-   */
-  servingCanisterId?: Principal
 }
 
 /** Where the dev server (`npm run dev`) points when there is no `ic_env` cookie. */
 const DEV_HOST = 'http://localhost:8000'
 
-/** Set by the IC HTTP gateway on every response it serves. */
-const CANISTER_ID_HEADER = 'x-ic-canister-id'
-
-export async function detectNetwork(): Promise<Network> {
+export function detectNetwork(): Network {
   const env = safeGetCanisterEnv()
 
   if (!env) {
@@ -42,14 +34,12 @@ export async function detectNetwork(): Promise<Network> {
     return { kind: 'other', host: DEV_HOST }
   }
 
-  const kind = isMainnetRootKey(env.IC_ROOT_KEY) ? 'mainnet' : 'other'
   return {
-    kind,
+    kind: isMainnetRootKey(env.IC_ROOT_KEY) ? 'mainnet' : 'other',
     // Same origin as the page, so `/api/v2` calls stay same-origin on both the
     // local gateway and mainnet.
     host: window.location.origin,
     rootKey: env.IC_ROOT_KEY,
-    servingCanisterId: kind === 'mainnet' ? undefined : await fetchServingCanisterId(),
   }
 }
 
@@ -60,17 +50,6 @@ export async function createAgent(network: Network, identity: Identity): Promise
     rootKey: network.rootKey,
     shouldFetchRootKey: network.rootKey === undefined,
   })
-}
-
-/** Asks the gateway which canister is behind this origin. */
-async function fetchServingCanisterId(): Promise<Principal | undefined> {
-  try {
-    const response = await fetch(window.location.origin, { method: 'HEAD' })
-    const header = response.headers.get(CANISTER_ID_HEADER)
-    return header ? Principal.fromText(header) : undefined
-  } catch {
-    return undefined
-  }
 }
 
 function isMainnetRootKey(rootKey: Uint8Array): boolean {

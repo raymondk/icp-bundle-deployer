@@ -1,9 +1,11 @@
 /**
  * Creating canisters from the browser, and applying the settings a manifest declares.
  *
- * Which creation path is available depends on the network, not on a preference:
- * ingress messages carry no cycles, so mainnet has to go through the cycles ledger,
- * while a local replica exposes free provisional creation.
+ * Creation always goes through the cycles ledger, on every network. An ingress
+ * message cannot carry cycles, so the management canister's `create_canister` is out
+ * of reach from a browser — but the cycles ledger is a canister like any other, and
+ * icp-cli deploys it on local networks at the same well-known address it has on
+ * mainnet. One path, so a local deployment exercises exactly what mainnet will do.
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
@@ -11,36 +13,23 @@ import type { Principal } from '@icp-sdk/core/principal'
 import { IcManagementCanister, type CanisterSettings } from '@icp-sdk/canisters/ic-management'
 
 import * as cyclesLedger from './cycles-ledger'
-import type { Network } from './network'
-import { provisionalCreateCanister } from './provisional'
 
 /** Matches the default `icp deploy` uses to fund a new canister. */
 export const DEFAULT_CREATION_CYCLES = 2_000_000_000_000n
 
 /**
- * Creates an empty canister controlled by the caller.
+ * Creates an empty canister controlled by the caller, paid for from the caller's
+ * cycles ledger balance.
  *
  * Manifest settings are applied afterwards rather than at creation: that keeps the
- * caller in control for the install, and lets both networks share one settings path
- * through the management canister's typed client.
+ * caller in control through the install, and routes every settings change through
+ * the management canister's typed client.
  */
 export async function createCanister(
   agent: HttpAgent,
-  network: Network,
   cycles: bigint = DEFAULT_CREATION_CYCLES,
 ): Promise<Principal> {
-  if (network.kind === 'mainnet') {
-    return cyclesLedger.createCanister(agent, cycles)
-  }
-
-  if (!network.servingCanisterId) {
-    throw new Error(
-      'Cannot create canisters on this network: the HTTP gateway did not say which canister ' +
-        'serves this page, so there is no effective canister id to route creation through. ' +
-        'Open the deployer from its canister URL rather than a dev server.',
-    )
-  }
-  return provisionalCreateCanister(agent, cycles, network.servingCanisterId)
+  return cyclesLedger.createCanister(agent, cycles)
 }
 
 export async function applySettings(
