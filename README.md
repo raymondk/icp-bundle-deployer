@@ -172,6 +172,26 @@ serve. `npm run dev` is fine for working on the page itself.
 For the same reason, [`icp.yaml`](./icp.yaml) pins `@dfinity/static-site` at `v0.3.3` or
 later — earlier releases do not serve the `ic_env` cookie that network detection reads.
 
+## Tests
+
+```bash
+npm test         # offline: unpacking, manifest validation, integrity
+npm run test:e2e # deploys a real bundle to the local network
+```
+
+The offline suite builds tar archives in memory, so it needs no fixtures and no
+network. Most of its cases assert a *refusal* — a script build step, a wasm or plugin
+referenced by URL, a tampered digest, Candid-text init args — because those decide
+whether a deployment starts at all, and the point is that a bad bundle is rejected
+before any canister exists.
+
+The e2e suite needs a running local network (`icp network start -d`). It builds a
+two-canister bundle from the published certified-assets release (cached under
+`.cache/` after the first run), funds a fresh identity with `icp cycles transfer`,
+deploys through the same modules the page uses, and then checks the result from
+outside: module hashes, controllers, colocation on one subnet, the injected canister
+IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
+
 ## Layout
 
 | Path | Role |
@@ -181,6 +201,7 @@ later — earlier releases do not serve the `ic_env` cookie that network detecti
 | `src/sync/` | plugin transpilation, the WASI sandbox, the `canister-call` bridge |
 | `src/deploy.ts` | per-canister orchestration with progress events |
 | `src/ui/` | the page |
+| `test/` | the offline and e2e suites |
 
 ## Deploying to mainnet
 

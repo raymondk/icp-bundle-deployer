@@ -29,3 +29,6 @@ dist-ssr
 # See: https://github.com/dfinity/icp-cli/blob/main/docs/concepts/project-model.md#whats-safe-to-delete
 
 bundles/
+
+# cached release artifacts used by the e2e suite
+.cache/
