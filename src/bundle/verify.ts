@@ -28,14 +28,28 @@ export async function verifyBundle(manifest: BundleManifest): Promise<BundleDige
   for (const canister of manifest.canisters) {
     const digest = await sha256Hex(canister.wasm)
     digests.set(canister.name, digest)
+    check(canister.wasmPath, canister.sha256, digest, `canister "${canister.name}"`)
 
-    if (canister.sha256 !== undefined && canister.sha256 !== digest) {
-      throw new IntegrityError(
-        `"${canister.wasmPath}" does not match the digest declared for canister ` +
-          `"${canister.name}".\n  expected ${canister.sha256}\n  actual   ${digest}`,
+    // A sync plugin runs with the same reach as the deployment itself, so its wasm
+    // is held to the same standard as the canister's.
+    for (const step of canister.sync) {
+      check(
+        step.pluginPath,
+        step.sha256,
+        await sha256Hex(step.wasm),
+        `the sync plugin of canister "${canister.name}"`,
       )
     }
   }
 
   return digests
+}
+
+function check(path: string, expected: string | undefined, actual: string, subject: string): void {
+  if (expected !== undefined && expected !== actual) {
+    throw new IntegrityError(
+      `"${path}" does not match the digest declared for ${subject}.\n` +
+        `  expected ${expected}\n  actual   ${actual}`,
+    )
+  }
 }

@@ -23,6 +23,20 @@ export interface BundleCanister {
   /** Candid-encoded init argument. `DIDL\0\0` (the empty tuple) when unspecified. */
   initArg: Uint8Array
   settings: CanisterSettings
+  /** Plugin steps to run after the wasm is installed, in declaration order. */
+  sync: SyncStep[]
+}
+
+/** A `type: plugin` sync step: a wasm component plus what it is allowed to read. */
+export interface SyncStep {
+  /** Path of the plugin wasm inside the archive. */
+  pluginPath: string
+  wasm: Uint8Array
+  sha256?: string
+  /** Directories preopened read-only for the plugin, relative to the bundle root. */
+  dirs: string[]
+  /** Files the host reads up front and passes inline. */
+  files: { name: string; content: string }[]
 }
 
 export interface BundleManifest {
@@ -80,14 +94,6 @@ function parseCanister(canister: Record<string, unknown>, entries: ArchiveEntrie
     throw new ManifestError('Every canister in the manifest needs a name.')
   }
 
-  const syncSteps = asArray(asRecord(canister.sync ?? {}, `${name}.sync`).steps, `${name}.sync.steps`)
-  if (syncSteps.length > 0) {
-    throw new ManifestError(
-      `Canister "${name}" declares sync steps. Syncing assets is not supported yet — ` +
-        'this deployer only creates canisters and installs their wasm.',
-    )
-  }
-
   const { wasmPath, sha256 } = parseBuild(name, canister.build)
   const wasm = entries.get(wasmPath)
   if (!wasm) {
@@ -103,7 +109,74 @@ function parseCanister(canister: Record<string, unknown>, entries: ArchiveEntrie
     sha256,
     initArg: parseInitArgs(name, canister.init_args, entries),
     settings: parseSettings(name, canister.settings),
+    sync: parseSync(name, canister.sync, entries),
   }
+}
+
+function parseSync(name: string, sync: unknown, entries: ArchiveEntries): SyncStep[] {
+  const steps = asArray(asRecord(sync ?? {}, `${name}.sync`).steps, `${name}.sync.steps`)
+
+  return steps.map((raw, index) => {
+    const step = asRecord(raw, `${name}.sync.steps[${index}]`)
+
+    if (step.type !== 'plugin') {
+      throw new ManifestError(
+        `Canister "${name}" has a \`${String(step.type)}\` sync step. A browser cannot run ` +
+          'shell commands, so only `plugin` sync steps are supported.',
+      )
+    }
+    if (typeof step.path !== 'string' || step.path === '') {
+      const reason =
+        typeof step.url === 'string'
+          ? 'it points at a URL instead of a file inside the bundle'
+          : 'it has no `path`'
+      throw new ManifestError(
+        `A sync step of canister "${name}" cannot be used because ${reason}. ` +
+          'A bundle must carry every plugin it runs.',
+      )
+    }
+
+    const wasm = entries.get(step.path)
+    if (!wasm) {
+      throw new ManifestError(
+        `Canister "${name}" refers to the sync plugin "${step.path}", which is not in the bundle.`,
+      )
+    }
+
+    const sha256 = step.sha256
+    if (sha256 !== undefined && typeof sha256 !== 'string') {
+      throw new ManifestError(`The \`sha256\` of a sync step of canister "${name}" must be a hex string.`)
+    }
+
+    const dirs = asArray(step.dirs, `${name}.sync.steps[${index}].dirs`).map((dir) => {
+      if (typeof dir !== 'string' || dir === '') {
+        throw new ManifestError(`Every entry in the \`dirs\` of canister "${name}" must be a path.`)
+      }
+      return dir
+    })
+
+    const files = asArray(step.files, `${name}.sync.steps[${index}].files`).map((path) => {
+      if (typeof path !== 'string') {
+        throw new ManifestError(`Every entry in the \`files\` of canister "${name}" must be a path.`)
+      }
+      const content = entries.get(path)
+      if (!content) {
+        throw new ManifestError(
+          `Canister "${name}" declares the sync file "${path}", which is not in the bundle.`,
+        )
+      }
+      return { name: path, content: new TextDecoder().decode(content) }
+    })
+
+    if (dirs.length === 0 && files.length === 0) {
+      throw new ManifestError(
+        `A sync step of canister "${name}" declares neither \`dirs\` nor \`files\`, so it has ` +
+          'nothing to sync.',
+      )
+    }
+
+    return { pluginPath: step.path, wasm, sha256: sha256?.toLowerCase(), dirs, files }
+  })
 }
 
 function parseBuild(

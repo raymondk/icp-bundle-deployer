@@ -11,6 +11,7 @@ import { deployBundle, formatBytes, type DeployEvent, type DeployResult } from '
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from '../ic/auth'
 import { createAgent, describeNetwork, type Network } from '../ic/network'
 import { cyclesBalance, formatCycles } from '../ic/cycles-ledger'
+import { supportsJspi } from '../sync'
 
 interface State {
   network: Network
@@ -142,6 +143,14 @@ export function mountApp(root: HTMLElement, network: Network): void {
           <td><strong>${escapeHtml(canister.name)}</strong></td>
           <td><code>${escapeHtml(canister.wasmPath)}</code></td>
           <td>${escapeHtml(formatBytes(canister.wasm.length))}</td>
+          <td>${
+            canister.sync.length === 0
+              ? '<span class="muted">—</span>'
+              : canister.sync
+                  .flatMap((step) => step.dirs)
+                  .map((dir) => `<code>${escapeHtml(dir)}</code>`)
+                  .join('<br />')
+          }</td>
           <td class="digest">${
             canister.sha256
               ? '<span class="ok">sha256 verified</span>'
@@ -153,14 +162,25 @@ export function mountApp(root: HTMLElement, network: Network): void {
       )
       .join('')
 
+    // A plugin cannot wait for a canister call without JSPI, so say so before the
+    // user starts a deployment that would stop halfway.
+    const needsSync = manifest.canisters.some((canister) => canister.sync.length > 0)
+    const warning =
+      needsSync && !supportsJspi()
+        ? `<p class="warn">This bundle syncs assets, which needs WebAssembly JSPI — available
+           in Chrome 137+ and Edge, and behind a flag in Firefox. Canisters would be created
+           and their wasm installed, but the sync would fail.</p>`
+        : ''
+
     bundlePanel.innerHTML = `
       <p class="loaded">Loaded <strong>${escapeHtml(fileName)}</strong> — ${
         manifest.canisters.length
       } canister${manifest.canisters.length === 1 ? '' : 's'}.</p>
       <table class="canisters">
-        <thead><tr><th>Canister</th><th>Wasm</th><th>Size</th><th>Integrity</th></tr></thead>
+        <thead><tr><th>Canister</th><th>Wasm</th><th>Size</th><th>Syncs</th><th>Integrity</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>`
+      </table>
+      ${warning}`
   }
 
   function renderDeployButton(): void {
@@ -286,11 +306,17 @@ export function mountApp(root: HTMLElement, network: Network): void {
   })
 
   deployButton.addEventListener('click', () => {
-    const { bundle, agent, network } = state
-    if (!bundle || !agent) return
+    const { bundle, agent, network, session } = state
+    if (!bundle || !agent || !session) return
     void withBusy(async () => {
       log.replaceChildren()
-      state.result = await deployBundle({ bundle, agent, network, onEvent: onDeployEvent })
+      state.result = await deployBundle({
+        bundle,
+        agent,
+        network,
+        identityPrincipal: session.principal,
+        onEvent: onDeployEvent,
+      })
       renderResult()
     })
   })

@@ -1,18 +1,24 @@
 /**
- * Deploys a verified bundle: for each canister, create it, apply its settings, and
- * install its wasm.
+ * Deploys a verified bundle, in the phases `icp deploy` uses.
+ *
+ * The phases exist for one reason: canisters have to discover each other. Every
+ * canister is created first so all the IDs are known, then each is given the whole
+ * set as `PUBLIC_CANISTER_ID:*` environment variables, and only then is any wasm
+ * installed. Deploying one canister at a time would leave the first one unable to
+ * learn the second one's ID.
  *
  * The whole bundle is validated and hashed before this runs, so a failure here means
- * the network rejected something. When that happens the run stops and reports the
- * canisters that already exist, so nothing is silently left behind.
+ * the network rejected something. When that happens the run stops and reports which
+ * canisters exist but are not finished, so nothing is silently left behind.
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import type { Principal } from '@icp-sdk/core/principal'
-import type { Bundle } from './bundle'
+import type { Bundle, BundleCanister } from './bundle'
 import { applySettings, createCanister } from './ic/create'
 import { installCode } from './ic/install'
 import type { Network } from './ic/network'
+import { runSyncStep } from './sync'
 
 export interface DeployedCanister {
   name: string
@@ -29,7 +35,7 @@ export type DeployEvent =
 export interface DeployResult {
   /** Canisters fully deployed, in order. */
   deployed: DeployedCanister[]
-  /** Canisters created before a failure but left without a working install. */
+  /** Canisters created before a failure but not finished. */
   incomplete: DeployedCanister[]
   error?: string
 }
@@ -38,60 +44,158 @@ export interface DeployOptions {
   bundle: Bundle
   agent: HttpAgent
   network: Network
+  /** Principal the deployment signs as; sync plugins are told who is calling. */
+  identityPrincipal: Principal
   onEvent?: (event: DeployEvent) => void
 }
+
+/**
+ * Prefix icp-cli uses for injected canister IDs. The `PUBLIC_` part is a security
+ * boundary, not decoration: the asset canister only republishes `PUBLIC_`-prefixed
+ * variables in its `ic_env` cookie, keeping everything else canister-only.
+ */
+const CANISTER_ID_VARIABLE = 'PUBLIC_CANISTER_ID:'
 
 export async function deployBundle({
   bundle,
   agent,
   network,
+  identityPrincipal,
   onEvent = () => {},
 }: DeployOptions): Promise<DeployResult> {
-  const deployed: DeployedCanister[] = []
-  const incomplete: DeployedCanister[] = []
+  const canisters = bundle.manifest.canisters
+  const created = new Map<string, Principal>()
+  const finished: DeployedCanister[] = []
 
-  for (const canister of bundle.manifest.canisters) {
-    const { name } = canister
-    onEvent({ type: 'started', name })
+  const outcome = (error: string): DeployResult => ({
+    deployed: finished,
+    incomplete: [...created]
+      .filter(([name]) => !finished.some((done) => done.name === name))
+      .map(([name, canisterId]) => ({ name, canisterId })),
+    error,
+  })
 
-    let canisterId: Principal
+  // ── Create ────────────────────────────────────────────────────────────────
+  for (const canister of canisters) {
+    onEvent({ type: 'started', name: canister.name })
     try {
-      canisterId = await createCanister(agent, network)
+      const canisterId = await createCanister(agent, network)
+      created.set(canister.name, canisterId)
+      onEvent({ type: 'created', name: canister.name, canisterId })
     } catch (error) {
-      const message = `Could not create canister "${name}": ${describe(error)}`
-      onEvent({ type: 'failed', name, message })
-      return { deployed, incomplete, error: message }
+      const message = `Could not create canister "${canister.name}": ${describe(error)}`
+      onEvent({ type: 'failed', name: canister.name, message })
+      return outcome(message)
     }
-    onEvent({ type: 'created', name, canisterId })
-
-    try {
-      // Controllers are applied last: dropping ourselves as controller before the
-      // install would lock us out of the canister we are still setting up.
-      const { controllers, ...resourceSettings } = canister.settings
-
-      await applySettings(agent, canisterId, resourceSettings)
-
-      onEvent({ type: 'progress', name, message: `Installing ${formatBytes(canister.wasm.length)}…` })
-      await installCode(agent, canisterId, canister.wasm, canister.initArg, {
-        onProgress: (uploaded, total) =>
-          onEvent({ type: 'progress', name, message: `Uploading chunk ${uploaded} of ${total}…` }),
-      })
-
-      if (controllers) {
-        await applySettings(agent, canisterId, { controllers })
-      }
-    } catch (error) {
-      const message = `Could not install canister "${name}" (${canisterId.toText()}): ${describe(error)}`
-      incomplete.push({ name, canisterId })
-      onEvent({ type: 'failed', name, message })
-      return { deployed, incomplete, error: message }
-    }
-
-    deployed.push({ name, canisterId })
-    onEvent({ type: 'installed', name, canisterId })
   }
 
-  return { deployed, incomplete }
+  // ── Settings, including the canister IDs every canister needs ─────────────
+  const discovery = [...created].map(([name, canisterId]) => ({
+    name: `${CANISTER_ID_VARIABLE}${name}`,
+    value: canisterId.toText(),
+  }))
+
+  for (const canister of canisters) {
+    const canisterId = created.get(canister.name)!
+    // Controllers are applied at the very end: dropping ourselves as controller now
+    // would lock us out of the canister we are still setting up.
+    const { controllers: _controllers, ...settings } = canister.settings
+    const environmentVariables = mergeEnvironment(canister, discovery)
+
+    try {
+      onEvent({
+        type: 'progress',
+        name: canister.name,
+        message: `Setting ${environmentVariables.length} environment variable(s)…`,
+      })
+      await applySettings(agent, canisterId, { ...settings, environmentVariables })
+    } catch (error) {
+      const message = `Could not configure canister "${canister.name}" (${canisterId.toText()}): ${describe(error)}`
+      onEvent({ type: 'failed', name: canister.name, message })
+      return outcome(message)
+    }
+  }
+
+  // ── Install, then sync ────────────────────────────────────────────────────
+  for (const canister of canisters) {
+    const canisterId = created.get(canister.name)!
+    try {
+      onEvent({
+        type: 'progress',
+        name: canister.name,
+        message: `Installing ${formatBytes(canister.wasm.length)}…`,
+      })
+      await installCode(agent, canisterId, canister.wasm, canister.initArg, {
+        onProgress: (uploaded, total) =>
+          onEvent({
+            type: 'progress',
+            name: canister.name,
+            message: `Uploading chunk ${uploaded} of ${total}…`,
+          }),
+      })
+
+      // Sync runs while we are still a controller — a plugin must be authorized on
+      // the canister it syncs — and after the environment variables are in place,
+      // since the asset canister captures them when a sync starts.
+      for (const step of canister.sync) {
+        onEvent({
+          type: 'progress',
+          name: canister.name,
+          message: `Syncing ${step.dirs.join(', ')}…`,
+        })
+        await runSyncStep({
+          agent,
+          canisterId,
+          step,
+          entries: bundle.entries,
+          identityPrincipal,
+          environment: network.kind === 'mainnet' ? 'ic' : 'local',
+          onOutput: (line) => onEvent({ type: 'progress', name: canister.name, message: line }),
+        })
+      }
+    } catch (error) {
+      const message = `Could not install canister "${canister.name}" (${canisterId.toText()}): ${describe(error)}`
+      onEvent({ type: 'failed', name: canister.name, message })
+      return outcome(message)
+    }
+
+    finished.push({ name: canister.name, canisterId })
+    onEvent({ type: 'installed', name: canister.name, canisterId })
+  }
+
+  // ── Hand over control, if the bundle asked for it ─────────────────────────
+  for (const canister of canisters) {
+    if (!canister.settings.controllers) continue
+    const canisterId = created.get(canister.name)!
+    try {
+      await applySettings(agent, canisterId, { controllers: canister.settings.controllers })
+    } catch (error) {
+      const message = `Deployed canister "${canister.name}" (${canisterId.toText()}) but could not set its controllers: ${describe(error)}`
+      onEvent({ type: 'failed', name: canister.name, message })
+      return { deployed: finished, incomplete: [], error: message }
+    }
+  }
+
+  return { deployed: finished, incomplete: [] }
+}
+
+/**
+ * The bundle's own variables plus the discovered canister IDs. A bundle may name a
+ * canister outside itself (an external ledger, say) and that entry is preserved;
+ * for names the bundle deploys, the ID from this deployment is the true one.
+ */
+function mergeEnvironment(
+  canister: BundleCanister,
+  discovery: { name: string; value: string }[],
+): { name: string; value: string }[] {
+  const merged = new Map<string, string>()
+  for (const { name, value } of canister.settings.environmentVariables ?? []) {
+    merged.set(name, value)
+  }
+  for (const { name, value } of discovery) {
+    merged.set(name, value)
+  }
+  return [...merged].map(([name, value]) => ({ name, value }))
 }
 
 export function formatBytes(bytes: number): string {

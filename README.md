@@ -11,9 +11,13 @@ holds a resolved `icp.yaml`, with every artifact it needs alongside it, referenc
 path relative to the tar root:
 
 ```
-backend-bundle.icp
-├── icp.yaml
-└── canisters/backend-example.wasm
+backend-bundle.icp                 frontend-bundle.icp
+├── icp.yaml                       ├── icp.yaml
+└── canisters/                     ├── canisters/
+    └── backend-example.wasm       │   ├── frontend-example.wasm.gz
+                                   │   └── frontend-example/dist/…
+                                   └── plugins/
+                                       └── certified-assets-0.3.3.wasm
 ```
 
 ```yaml
@@ -39,27 +43,70 @@ environments: []
 2. **Targets the network that serves it** — the asset canister hosting this page certifies
    an `ic_env` cookie carrying its network's root key. That key both verifies responses and
    distinguishes mainnet from a test network, so no network has to be chosen by hand.
-3. **Creates each canister** — funded with 2T cycles, the same default `icp deploy` uses.
+3. **Creates every canister** — funded with 2T cycles, the same default `icp deploy` uses.
    On mainnet that goes through the cycles ledger, charged to the signed-in principal's
    balance; an ingress message cannot carry cycles, so this is the only client-side path.
    On a test network it uses free provisional creation.
-4. **Installs each wasm** — in one `install_code` call, or through the chunk store for wasms
+4. **Injects the canister IDs** — see below.
+5. **Installs each wasm** — in one `install_code` call, or through the chunk store for wasms
    above the ingress limit.
-5. **Applies the manifest's settings** — resource settings before the install, controllers
-   after it, so the deployer keeps control of the canister while it is still setting it up.
+6. **Runs the bundle's sync plugin** — see below. Assets are uploaded by the same wasm
+   `icp sync` runs.
+7. **Hands over control** — controllers are applied last, so the deployer keeps control of
+   each canister while it is still setting it up.
 
-Canisters deploy one at a time. If one fails, the run stops and the page reports which
-canisters were created but left without a working install, so nothing is silently
-abandoned — they exist and you control them.
+Those are phases, not a per-canister loop, and the order matters: every canister is created
+before any wasm is installed. If a phase fails the run stops and the page reports which
+canisters exist but are unfinished, so nothing is silently abandoned — they exist and you
+control them.
+
+## Canister discovery
+
+Canister IDs are assigned at deployment time, so a frontend cannot hardcode the backend it
+calls. icp-cli solves this by injecting IDs as canister environment variables, and this
+deployer does the same thing in the same order:
+
+- once every canister exists, each one is given the whole set as
+  `PUBLIC_CANISTER_ID:<name>` variables — including its own — merged over any variables the
+  manifest declared;
+- the variables live in canister settings, not in the wasm, so the same build runs in any
+  environment;
+- the asset canister republishes them, plus the network's root key, in its certified
+  `ic_env` cookie, which a frontend reads with `getCanisterEnv()` from
+  `@icp-sdk/core/agent/canister-env`.
+
+The `PUBLIC_` prefix is a security boundary rather than a convention: the asset canister
+publishes only `PUBLIC_`-prefixed variables to the browser, so anything else in a
+manifest's `environment_variables` stays canister-only.
+
+## Syncing assets
+
+A frontend canister's bundle carries a sync plugin — a `wasm32-wasip2` component — and the
+directory it should upload. Rather than reimplementing what that plugin does, the deployer
+**runs it**, so compression, clean URLs, redirect rules and the resulting state hash match
+a CLI deployment instead of approximating it:
+
+- **jco's bindgen lowers the component to JavaScript at runtime**, in the page. Nothing is
+  pinned to a plugin version — a bundle built against any release deploys as-is.
+- **`preview2-shim` provides the WASI world** with an in-memory filesystem holding only the
+  directories the manifest declared, mirroring the read-only preopen sandbox icp-cli gives
+  a plugin. There is no network and no writable filesystem inside it.
+- **`canister-call`, the plugin's one non-WASI import, is backed by agent-js** and fixed to
+  the canister being synced, exactly as the CLI host fixes it.
+- The plugin's own progress output is piped into the deployment log.
+
+That last import is declared *synchronous*, and a browser cannot block on a network round
+trip. The bridge is **WebAssembly JSPI**, which suspends the wasm stack until the call
+settles — shipped in Chrome 137+ and Edge, behind a flag in Firefox, in progress in Safari.
+On a browser without it the page says so up front; creating canisters and installing wasms
+are unaffected.
 
 ## Scope
 
-This deploys canisters and installs wasms. It does **not** sync frontend assets: a bundle
-that declares a `sync:` step is rejected with an explanation rather than half-deployed.
-Also rejected, each with a specific message: build steps that are not `pre-built`, wasms
-referenced by URL instead of by path, project dependencies, and init args in Candid *text*
-format (which needs an encoder the browser doesn't have — use `format: hex` or
-`format: bin`).
+Rejected before anything is deployed, each with a specific message: build steps that are
+not `pre-built`, wasms or plugins referenced by URL instead of by path, `script` sync steps
+(a browser has no shell), project dependencies, and init args in Candid *text* format
+(which needs an encoder the browser doesn't have — use `format: hex` or `format: bin`).
 
 ## Run it
 
@@ -90,6 +137,7 @@ later — earlier releases do not serve the `ic_env` cookie that network detecti
 |---|---|
 | `src/bundle/` | archive reader, manifest parsing and validation, integrity checks |
 | `src/ic/` | network detection, identity, canister creation, wasm install |
+| `src/sync/` | plugin transpilation, the WASI sandbox, the `canister-call` bridge |
 | `src/deploy.ts` | per-canister orchestration with progress events |
 | `src/ui/` | the page |
 

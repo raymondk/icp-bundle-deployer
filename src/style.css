@@ -195,6 +195,9 @@ button.primary {
 .warn {
   color: var(--warn);
 }
+.muted {
+  color: var(--muted);
+}
 .error,
 .log li.error {
   color: var(--error);
