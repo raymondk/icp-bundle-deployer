@@ -196,7 +196,9 @@ button.primary {
 
 .log {
   margin: 1rem 0 0;
-  padding-left: 1.4rem;
+  /* Wide enough that three-digit line numbers are not clipped: a sync of any size
+     runs well past line 99. */
+  padding-left: 2.8rem;
   max-height: 18rem;
   overflow-y: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
