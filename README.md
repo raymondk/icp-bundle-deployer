@@ -101,7 +101,9 @@ await initialize(await readFile('src/lib/wasm/deployer_bg.wasm'))
 6. **Runs the bundle's sync plugin** — see below. Assets are uploaded by the same wasm
    `icp sync` runs.
 7. **Hands over control** — controllers are applied last, so the deployer keeps control of
-   each canister while it is still setting it up.
+   each canister while it is still setting it up. Whoever the manifest names is *added* to
+   the controllers rather than replacing them, so the identity that paid for a canister
+   never loses access to it — the same thing `icp deploy` leaves behind.
 
 Those are phases, not a per-canister loop, and the order matters: every canister is created
 before any wasm is installed. If a phase fails the run stops and the page reports which

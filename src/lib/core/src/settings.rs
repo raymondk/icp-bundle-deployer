@@ -40,20 +40,33 @@ pub fn configuration(canister: &Canister) -> Option<CanisterSettings> {
 ///
 /// `None` when the manifest names no controllers, which leaves the deployer in
 /// control — the same thing `icp deploy` leaves behind.
+///
+/// `caller` is added to whatever the manifest declares, because
+/// `update_settings` replaces a controller list rather than adding to it and the
+/// deployer is the only controller a canister it just created has. Sending the
+/// declared list verbatim would hand a canister the deployer paid for to the
+/// bundle's author and lock the deployer out of it — and `controllers: []`,
+/// which a manifest may legally say, would lock everyone out permanently. This
+/// is what icp-cli does for the same reason, on both the create and the update
+/// path.
 pub fn controllers(
     canister: &Canister,
     ids: &IdMapping,
+    caller: Principal,
 ) -> Result<Option<CanisterSettings>, String> {
     let Some(declared) = &canister.settings.controllers else {
         return Ok(None);
     };
 
-    let (resolved, unresolved) = resolve_controllers(declared, ids);
+    let (mut resolved, unresolved) = resolve_controllers(declared, ids);
     if !unresolved.is_empty() {
         return Err(format!(
             "its controllers name {}, which this deployment did not create",
             unresolved.join(", ")
         ));
+    }
+    if !resolved.contains(&caller) {
+        resolved.push(caller);
     }
 
     Ok(Some(CanisterSettings {

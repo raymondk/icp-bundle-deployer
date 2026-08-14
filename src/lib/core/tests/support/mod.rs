@@ -31,6 +31,22 @@ pub fn tar(entries: Vec<Entry>) -> Vec<u8> {
     builder.into_inner().expect("finishing the archive")
 }
 
+/// Rewrites the size the archive's first entry header claims, leaving the entry
+/// itself as it was, and repairs the checksum so a reader still accepts the
+/// header. The size a tar header states is the one field a reader must not trust:
+/// it arrives before any of the data it describes.
+pub fn overstate_first_entry(mut tar: Vec<u8>, size: u64) -> Vec<u8> {
+    let header = &mut tar[..512];
+    header[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+
+    // The checksum is the sum of every header byte with its own field read as
+    // spaces, six octal digits followed by a NUL and a space.
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    tar
+}
+
 pub fn gzip(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder

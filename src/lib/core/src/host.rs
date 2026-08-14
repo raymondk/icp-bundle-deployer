@@ -112,6 +112,12 @@ impl Host {
         Self { js, caller }
     }
 
+    /// The principal every call is signed as, and therefore the controller of
+    /// every canister this deployment creates.
+    pub fn caller(&self) -> Principal {
+        self.caller
+    }
+
     pub async fn update_call(
         &self,
         canister: Principal,

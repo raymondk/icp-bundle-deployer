@@ -49,6 +49,7 @@ pub fn read_archive(data: &[u8]) -> Result<BundleFiles, ArchiveError> {
     };
 
     let mut entries = BTreeMap::new();
+    let unpacked = tar.len();
     let mut archive = tar::Archive::new(Cursor::new(tar));
     for entry in archive.entries().map_err(tar_error)? {
         let mut entry = entry.map_err(tar_error)?;
@@ -62,7 +63,12 @@ pub fn read_archive(data: &[u8]) -> Result<BundleFiles, ArchiveError> {
             .ok_or(ArchiveError::Name)?
             .to_owned();
 
-        let mut contents = Vec::with_capacity(entry.size() as usize);
+        // The size is what the entry's header claims, before a byte of it has
+        // been read: a corrupt or hostile header naming gigabytes would abort the
+        // module on a 32-bit heap instead of being reported as the truncation it
+        // is. The archive it came out of is the ceiling.
+        let claimed = usize::try_from(entry.size()).unwrap_or(usize::MAX);
+        let mut contents = Vec::with_capacity(claimed.min(unpacked));
         entry.read_to_end(&mut contents).map_err(tar_error)?;
         entries.insert(normalize(Path::new(&path)), contents);
     }

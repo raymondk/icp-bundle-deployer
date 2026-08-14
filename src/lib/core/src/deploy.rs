@@ -46,6 +46,24 @@ pub async fn deploy(
             "This bundle has no \"{environment}\" environment, so there is nothing to deploy to."
         ));
     };
+    if env.canisters.is_empty() {
+        return run.failed(format!(
+            "The \"{environment}\" environment of this bundle declares no canisters, so there is \
+             nothing to deploy to it."
+        ));
+    }
+    // An environment may name only some of the project's canisters, and the
+    // bundle was presented as everything the project declares — so say which
+    // ones this environment leaves out rather than quietly deploying fewer.
+    for name in bundle.project.canisters.keys() {
+        if !env.canisters.contains_key(name) {
+            emitter.emit(DeployEvent::Progress {
+                name: name.clone(),
+                message: format!("Not part of the \"{environment}\" environment; skipped."),
+            });
+        }
+    }
+
     // Which of the two id stores an implementation keeps; with one in-memory
     // store it makes no difference, but the crate's API asks for the answer.
     let is_cache = matches!(env.network.configuration, Configuration::Managed { .. });
@@ -167,6 +185,8 @@ pub async fn deploy(
     }
 
     // ── Hand over control, if the bundle asked for it ─────────────────────
+    // The deployer stays a controller alongside whoever the manifest names: a
+    // list sent verbatim would replace it, not extend it.
     let mapping = ids
         .lookup_by_environment(is_cache, environment)
         .unwrap_or_default();
@@ -176,7 +196,7 @@ pub async fn deploy(
             Err(message) => return run.handover_failed(emitter, name, message),
         };
 
-        let handover = match settings::controllers(canister, &mapping) {
+        let handover = match settings::controllers(canister, &mapping, host.caller()) {
             Ok(None) => continue,
             Ok(Some(handover)) => handover,
             Err(message) => {

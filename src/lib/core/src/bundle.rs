@@ -134,6 +134,19 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
         canisters.push(check_canister(&files, name, canister_dir, canister).await?);
     }
 
+    // An environment may override a canister's init args, so every variant a
+    // deployment could install is encoded here too, not just the declared one.
+    let mut environments: Vec<&String> = project.environments.keys().collect();
+    environments.sort();
+    for environment in environments {
+        for (name, (_, canister)) in &project.environments[environment].canisters {
+            let declared = project.canisters.get(name).map(|(_, c)| &c.init_args);
+            if declared != Some(&canister.init_args) {
+                check_init_args(name, Some(environment), canister)?;
+            }
+        }
+    }
+
     Ok(LoadedBundle {
         files,
         project,
@@ -159,6 +172,7 @@ async fn check_canister(
     canister_dir: &Path,
     canister: &Canister,
 ) -> Result<CanisterSummary, BundleError> {
+    let base = normalize(canister_dir);
     let wasm_path = artifact_path(canister_dir, canister)?;
     let wasm = read(files, &wasm_path, &format!("Canister \"{name}\""))?;
 
@@ -170,6 +184,8 @@ async fn check_canister(
         &digest,
         &format!("canister \"{name}\""),
     )?;
+
+    check_init_args(name, None, canister)?;
 
     let mut sync_dirs = Vec::new();
     for step in &canister.sync.steps {
@@ -186,7 +202,7 @@ async fn check_canister(
             )));
         };
 
-        let plugin_path = normalize(&canister_dir.join(&source.path));
+        let plugin_path = normalize(&base.join(&source.path));
         let plugin = read(
             files,
             &plugin_path,
@@ -202,7 +218,17 @@ async fn check_canister(
         )?;
 
         for dir in adapter.dirs.iter().flatten() {
-            let path = normalize(&canister_dir.join(dir));
+            let path = normalize(&base.join(dir));
+            // A plugin sees the canister's own directory and nothing above it, so
+            // a directory outside it has no path the plugin could resolve — and
+            // would otherwise be mounted somewhere it never looks.
+            if !path.starts_with(&base) {
+                return Err(BundleError::manifest(format!(
+                    "Canister \"{name}\" declares \"{dir}\" for syncing, which is outside the \
+                     canister's own directory. A sync plugin only ever sees that directory, so \
+                     there is nowhere to give it these files."
+                )));
+            }
             if files.under(&path).is_empty() {
                 return Err(BundleError::manifest(format!(
                     "Canister \"{name}\" declares \"{dir}\" for syncing, but the bundle contains \
@@ -213,12 +239,20 @@ async fn check_canister(
         }
 
         for file in adapter.files.iter().flatten() {
-            let path = normalize(&canister_dir.join(file));
-            read(
+            let path = normalize(&base.join(file));
+            let contents = read(
                 files,
                 &path,
                 &format!("The sync step of canister \"{name}\""),
             )?;
+            // These are handed to the plugin inline, as text; one that is not
+            // text cannot be passed to it at all.
+            if str::from_utf8(contents).is_err() {
+                return Err(BundleError::manifest(format!(
+                    "Canister \"{name}\" passes \"{file}\" to its sync plugin, which takes text, \
+                     but that file is not valid UTF-8."
+                )));
+            }
         }
     }
 
@@ -229,6 +263,30 @@ async fn check_canister(
         declared_sha256,
         digest,
         sync_dirs,
+    })
+}
+
+/// Encode a canister's init args and throw the bytes away: they are encoded
+/// again at install time, and this is the only place a value that cannot be
+/// encoded can be refused before any canister exists. Candid text is parsed and
+/// hex is decoded here, so neither can fail on chain.
+fn check_init_args(
+    name: &str,
+    environment: Option<&str>,
+    canister: &Canister,
+) -> Result<(), BundleError> {
+    let Some(args) = &canister.init_args else {
+        return Ok(());
+    };
+
+    args.to_bytes().map(|_| ()).map_err(|e| {
+        let subject = match environment {
+            Some(environment) => format!(
+                "The init args canister \"{name}\" is given in the \"{environment}\" environment"
+            ),
+            None => format!("The init args of canister \"{name}\""),
+        };
+        BundleError::manifest(format!("{subject} could not be encoded: {}", chain(&e)))
     })
 }
 

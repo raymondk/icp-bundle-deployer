@@ -54,6 +54,12 @@ pub enum PluginError {
     #[snafu(display("the file '{path}' the step passes to the plugin is not valid UTF-8"))]
     NotText { path: PathBuf },
 
+    #[snafu(display(
+        "the directory '{dir}' the step syncs is outside the canister's own directory, which is \
+         everything the plugin can see"
+    ))]
+    Escapes { dir: String },
+
     #[snafu(display("{message}"))]
     Host { message: String },
 }
@@ -120,10 +126,20 @@ impl JsPluginExecutor<'_> {
             }
         }
 
+        // The plugin resolves what it reads against the sandbox root, so a
+        // directory outside the base has no key it would ever look under. The
+        // bundle is refused for this at load time; a plugin invocation that gets
+        // here anyway must not silently sync nothing.
         let tree = Map::new();
         for dir in &invocation.dirs {
-            for (entry, contents) in self.files.under(&normalize(&base.join(dir))) {
-                let relative = entry.strip_prefix(&base).unwrap_or(entry);
+            let root = normalize(&base.join(dir));
+            if !root.starts_with(&base) {
+                return Err(PluginError::Escapes { dir: dir.clone() });
+            }
+            for (entry, contents) in self.files.under(&root) {
+                let relative = entry
+                    .strip_prefix(&base)
+                    .expect("an entry under the base is relative to it");
                 tree.set(
                     &JsValue::from_str(relative.as_str()),
                     &Uint8Array::from(contents),

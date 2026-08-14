@@ -260,6 +260,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
   }
 
   async function openBundle(file: File): Promise<void> {
+    // The outgoing bundle holds a whole uncompressed archive on the module's
+    // heap, and its JavaScript wrapper is too small for the collector to feel.
+    state.bundle?.dispose()
     state.bundle = undefined
     state.bundleError = undefined
     state.result = undefined

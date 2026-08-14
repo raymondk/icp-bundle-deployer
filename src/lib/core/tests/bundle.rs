@@ -10,7 +10,7 @@ mod support;
 use futures::executor::block_on;
 use icp_bundle_deployer_core::bundle::{BundleError, BundleErrorKind, LoadedBundle, load_bundle};
 use indoc::formatdoc;
-use support::{Entry, file, gzip, tar};
+use support::{Entry, file, gzip, overstate_first_entry, tar};
 
 const WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 const PLUGIN: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x01];
@@ -107,6 +107,16 @@ fn rejects_an_empty_archive() {
 fn rejects_a_truncated_archive() {
     let full = bundle(&minimal(), vec![]);
     refuses(&full[..700], BundleErrorKind::Archive, "truncated");
+}
+
+/// An entry's size is read from its header before any of the entry is, so a
+/// header claiming more than the archive can hold must be reported rather than
+/// allocated for: on the 32-bit heap the module runs on, reserving what a hostile
+/// header asks for aborts the instance instead of refusing the bundle.
+#[test]
+fn rejects_an_entry_claiming_more_than_the_archive_holds() {
+    let archive = overstate_first_entry(bundle(&minimal(), vec![]), 2 * 1024 * 1024 * 1024);
+    refuses(&archive, BundleErrorKind::Archive, "truncated");
 }
 
 // ── Manifest ────────────────────────────────────────────────────────────────
@@ -384,23 +394,124 @@ fn rejects_a_sync_file_the_bundle_does_not_carry() {
     );
 }
 
+/// A plugin is handed these files inline as text, so one that is not text has to
+/// be refused here rather than part-way through a sync — by then the canister is
+/// installed.
+#[test]
+fn rejects_a_sync_file_that_is_not_text() {
+    let step = formatdoc! {"
+        - type: plugin
+          path: plugins/sync.wasm
+          sha256: {}
+          files:
+          - config.txt
+    ", digest(PLUGIN)};
+    refuses(
+        &with_plugin(&step, vec![file("config.txt", vec![0xff, 0xfe, 0x00])]),
+        BundleErrorKind::Manifest,
+        "not valid utf-8",
+    );
+}
+
+/// A plugin's sandbox is rooted at the canister's own directory, so a directory
+/// above it cannot be given to the plugin at any path it would look under.
+#[test]
+fn rejects_a_sync_directory_outside_the_canister_directory() {
+    let canister = formatdoc! {"
+        name: site
+        build:
+          steps:
+          - type: pre-built
+            path: app.wasm
+            sha256: {}
+        sync:
+          steps:
+          - type: plugin
+            path: sync.wasm
+            sha256: {}
+            dirs:
+            - ../shared
+    ", digest(WASM), digest(PLUGIN)};
+
+    let archive = tar(vec![
+        file("icp.yaml", "canisters:\n- canisters/site\n"),
+        file("canisters/site/canister.yaml", canister.as_str()),
+        file("canisters/site/app.wasm", WASM),
+        file("canisters/site/sync.wasm", PLUGIN),
+        file("canisters/shared/index.html", "<h1>hi"),
+    ]);
+    refuses(
+        &archive,
+        BundleErrorKind::Manifest,
+        "outside the canister's own directory",
+    );
+}
+
 // ── Init args ───────────────────────────────────────────────────────────────
 
-/// Candid *text* init args are encoded by the same parser icp-cli uses, so a
-/// bundle no longer has to pre-encode them.
-#[test]
-fn accepts_candid_text_init_args() {
+/// A bundle whose one canister is initialized with `args`, written as the
+/// mapping under `init_args`.
+fn with_init_args(args: &str) -> Vec<u8> {
     let manifest = formatdoc! {"
         canisters:
         - name: app
           init_args:
-            value: '(42 : nat64)'
-            format: candid
+            {args}
           build:
             steps:
             - type: pre-built
               path: canisters/app.wasm
               sha256: {}
     ", digest(WASM)};
-    load(&bundle(&manifest, vec![])).expect("candid text init args should be accepted");
+    bundle(&manifest, vec![])
+}
+
+/// Candid *text* init args are encoded by the same parser icp-cli uses, so a
+/// bundle no longer has to pre-encode them.
+#[test]
+fn accepts_candid_text_init_args() {
+    load(&with_init_args("value: '(42 : nat64)'\n    format: candid"))
+        .expect("candid text init args should be accepted");
+}
+
+/// Init args are encoded at install time, which is after every canister has been
+/// created and funded — so they are encoded here as well, where a bad value can
+/// still refuse the bundle.
+#[test]
+fn rejects_candid_init_args_that_do_not_parse() {
+    refuses(
+        &with_init_args("value: '(this is not candid'\n    format: candid"),
+        BundleErrorKind::Manifest,
+        "init args of canister \"app\"",
+    );
+}
+
+#[test]
+fn rejects_hex_init_args_that_are_not_hex() {
+    refuses(
+        &with_init_args("value: 'zzzz'\n    format: hex"),
+        BundleErrorKind::Manifest,
+        "init args of canister \"app\"",
+    );
+}
+
+/// An environment may replace a canister's init args, and that value is what
+/// gets installed — so it is encoded too, not just the declared one.
+#[test]
+fn rejects_init_args_an_environment_overrides_with_something_unencodable() {
+    let manifest = formatdoc! {"
+        {}
+        environments:
+        - name: ic
+          network: ic
+          init_args:
+            app:
+              value: '(this is not candid'
+              format: candid
+    ", minimal()};
+    refuses(
+        &bundle(&manifest, vec![]),
+        BundleErrorKind::Manifest,
+        "\"ic\" environment",
+    );
 }

@@ -9,7 +9,7 @@
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import { Principal } from '@icp-sdk/core/principal'
-import { Bundle, loadBundle, type BundleSource } from './bundle'
+import { Bundle, isBundle, loadBundle, type BundleSource } from './bundle'
 import type { DeployEvent, DeployResult } from './events'
 import { createHost } from './host'
 import { DEFAULT_CREATION_CYCLES } from './ic/create'
@@ -61,32 +61,47 @@ export function createDeployer({
 
     async deploy(source, { subnet, onEvent = () => {} } = {}) {
       const bundle = await loadBundle(source)
+      // A bundle the caller passed in stays theirs to dispose of. One loaded here
+      // has no other owner, and holds the whole uncompressed archive.
+      const owned = !isBundle(source)
       await initialize()
 
-      const identityPrincipal = await agent.getPrincipal()
-      const host = createHost({
-        agent,
-        identityPrincipal,
-        cycles,
-        subnet: subnet === undefined ? undefined : toPrincipal(subnet),
-        onEvent,
-      })
+      try {
+        const identityPrincipal = await agent.getPrincipal()
+        const host = createHost({
+          agent,
+          identityPrincipal,
+          cycles,
+          subnet: subnet === undefined ? undefined : toPrincipal(subnet),
+          onEvent,
+        })
 
-      const result = await deployBundle(
-        Bundle.core(bundle),
-        host,
-        identityPrincipal.toText(),
-        environment ?? environmentOf(agent),
-        (event: RawEvent) => onEvent(enrich(event)),
-      )
+        const result = await deployBundle(
+          Bundle.core(bundle),
+          host,
+          identityPrincipal.toText(),
+          environment ?? environmentOf(agent),
+          (event: RawEvent) => onEvent(enrich(event)),
+        )
 
-      return enrichResult(result as RawResult)
+        return enrichResult(result as RawResult)
+      } finally {
+        if (owned) bundle.dispose()
+      }
     },
   }
 }
 
 /** The module reports canister ids as text; the library hands back principals. */
-type RawEvent = Omit<DeployEvent, 'canisterId'> & { canisterId?: string }
+type WithTextIds<Event> = Event extends { canisterId: Principal }
+  ? Omit<Event, 'canisterId'> & { canisterId: string }
+  : Event
+/**
+ * An event as the module serializes it. Distributed over the union one member at
+ * a time on purpose: `Omit` over a union keeps only the keys its members share,
+ * which here is `type` alone, so a single `Omit` would check none of the rest.
+ */
+type RawEvent = WithTextIds<DeployEvent>
 type RawResult = {
   deployed: { name: string; canisterId: string }[]
   incomplete: { name: string; canisterId: string }[]
@@ -94,11 +109,9 @@ type RawResult = {
 }
 
 function enrich(event: RawEvent): DeployEvent {
-  return (
-    event.canisterId === undefined
-      ? event
-      : { ...event, canisterId: Principal.fromText(event.canisterId) }
-  ) as DeployEvent
+  return 'canisterId' in event
+    ? { ...event, canisterId: Principal.fromText(event.canisterId) }
+    : event
 }
 
 function enrichResult(result: RawResult): DeployResult {

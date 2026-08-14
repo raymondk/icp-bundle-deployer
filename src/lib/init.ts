@@ -20,6 +20,14 @@ let started: Promise<void> | undefined
  * alongside the library, which is what a bundler and a browser want.
  */
 export function initialize(source?: InitInput): Promise<void> {
-  started ??= init(source === undefined ? undefined : { module_or_path: source }).then(() => {})
+  // Only success is remembered. The failure worth planning for is a Node process
+  // that reached the library before handing over the bytes, and the call that
+  // does hand them over has to be able to succeed.
+  started ??= init(source === undefined ? undefined : { module_or_path: source })
+    .then(() => {})
+    .catch((error: unknown) => {
+      started = undefined
+      throw error
+    })
   return started
 }

@@ -67,9 +67,18 @@ test('installs the wasm the manifest declared', async () => {
   assertEqual(moduleHash, expected, 'installed module hash')
 })
 
+// `update_settings` replaces a controller list rather than adding to it, so a
+// handover that sent the manifest's list verbatim would hand the canister away
+// and lock the deployer out of what it just paid for.
 test('leaves the deploying identity in control', async () => {
   const { controllers } = await canisterStatus(agent, deployed('plain').canisterId)
   assert(controllers.includes(principal.toText()), `deployer should be a controller, got ${controllers}`)
+})
+
+test('hands over to the controllers the manifest names', async () => {
+  const { controllers } = await canisterStatus(agent, deployed('plain').canisterId)
+  const site = deployed('site').canisterId.toText()
+  assert(controllers.includes(site), `site should have been added as a controller, got ${controllers}`)
 })
 
 test('charges the cycles ledger for what it created', async () => {
