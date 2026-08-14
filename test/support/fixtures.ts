@@ -9,7 +9,7 @@
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { sha256Hex } from '../../src/lib/bundle/verify'
+import { sha256Hex } from '../../src/lib'
 import { createTar, gzip } from './tar'
 
 const RELEASE = 'https://github.com/dfinity/certified-assets/releases/download/v0.3.3'
@@ -49,7 +49,10 @@ export async function fullstackBundle(): Promise<Fixture> {
 canisters:
 - name: plain
   settings:
-    controllers: null
+    # A canister name, resolved against the ids this deployment creates — and the
+    # deployer has to survive the handover alongside it.
+    controllers:
+    - site
   build:
     steps:
     - type: pre-built
