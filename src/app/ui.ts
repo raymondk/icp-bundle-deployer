@@ -149,19 +149,18 @@ export function mountApp(root: HTMLElement, network: Network): void {
       return
     }
 
-    const { fileName, manifest, digests } = state.bundle
-    const rows = manifest.canisters
+    const { fileName, canisters } = state.bundle
+    const rows = canisters
       .map(
         (canister) => `
         <tr>
           <td><strong>${escapeHtml(canister.name)}</strong></td>
           <td><code>${escapeHtml(canister.wasmPath)}</code></td>
-          <td>${escapeHtml(formatBytes(canister.wasm.length))}</td>
+          <td>${escapeHtml(formatBytes(canister.wasmSize))}</td>
           <td>${
-            canister.sync.length === 0
+            canister.syncDirs.length === 0
               ? '<span class="muted">—</span>'
-              : canister.sync
-                  .flatMap((step) => step.dirs)
+              : canister.syncDirs
                   .map((dir) => `<code>${escapeHtml(dir)}</code>`)
                   .join('<br />')
           }</td>
@@ -169,7 +168,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
             canister.sha256
               ? '<span class="ok">sha256 verified</span>'
               : `<span class="warn">no digest declared</span><br /><code>${escapeHtml(
-                  digests.get(canister.name) ?? '',
+                  canister.digest,
                 )}</code>`
           }</td>
         </tr>`,
@@ -178,7 +177,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
     // A plugin cannot wait for a canister call without JSPI, so say so before the
     // user starts a deployment that would stop halfway.
-    const needsSync = manifest.canisters.some((canister) => canister.sync.length > 0)
+    const needsSync = canisters.some((canister) => canister.syncDirs.length > 0)
     const warning =
       needsSync && !supportsJspi()
         ? `<p class="warn">This bundle syncs assets, which needs WebAssembly JSPI — available
@@ -188,8 +187,8 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
     bundlePanel.innerHTML = `
       <p class="loaded">Loaded <strong>${escapeHtml(fileName ?? 'bundle')}</strong> — ${
-        manifest.canisters.length
-      } canister${manifest.canisters.length === 1 ? '' : 's'}.</p>
+        canisters.length
+      } canister${canisters.length === 1 ? '' : 's'}.</p>
       <table class="canisters">
         <thead><tr><th>Canister</th><th>Wasm</th><th>Size</th><th>Syncs</th><th>Integrity</th></tr></thead>
         <tbody>${rows}</tbody>

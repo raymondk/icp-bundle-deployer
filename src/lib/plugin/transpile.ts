@@ -11,7 +11,7 @@
  * generated glue suspends the wasm stack while the promise settles.
  */
 
-import { sha256Hex } from '../bundle'
+import { sha256Hex } from '../wasm/deployer'
 
 export interface TranspiledPlugin {
   /** Self-contained ES module source exporting `instantiate`. */
@@ -36,7 +36,7 @@ export function supportsJspi(): boolean {
 }
 
 export async function transpilePlugin(wasm: Uint8Array): Promise<TranspiledPlugin> {
-  const key = await sha256Hex(wasm)
+  const key = sha256Hex(wasm)
   const cached = cache.get(key)
   if (cached) return cached
 

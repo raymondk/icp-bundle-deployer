@@ -21,6 +21,10 @@ import {
 } from '../src/lib'
 import { fullstackBundle } from './support/fixtures'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
+import { canisterStatus } from './support/status'
+import { loadModule } from './support/wasm'
+
+await loadModule()
 
 const HOST = 'http://localhost:8000'
 
@@ -57,19 +61,15 @@ test('deploys every canister in the bundle', () => {
   assertEqual(result.incomplete.length, 0, 'nothing left incomplete')
 })
 
-test('installs the wasm the manifest declared', () => {
-  const status = execFileSync('icp', ['canister', 'status', deployed('plain').canisterId.toText()], {
-    encoding: 'utf8',
-  })
-  const expected = bundle.manifest.canisters.find((c) => c.name === 'plain')!.sha256!
-  assert(status.includes(expected), `module hash should be ${expected}, got:\n${status}`)
+test('installs the wasm the manifest declared', async () => {
+  const { moduleHash } = await canisterStatus(agent, deployed('plain').canisterId)
+  const expected = bundle.canisters.find((canister) => canister.name === 'plain')!.sha256!
+  assertEqual(moduleHash, expected, 'installed module hash')
 })
 
-test('leaves the deploying identity in control', () => {
-  const status = execFileSync('icp', ['canister', 'status', deployed('plain').canisterId.toText()], {
-    encoding: 'utf8',
-  })
-  assert(status.includes(principal.toText()), 'deployer should be a controller')
+test('leaves the deploying identity in control', async () => {
+  const { controllers } = await canisterStatus(agent, deployed('plain').canisterId)
+  assert(controllers.includes(principal.toText()), `deployer should be a controller, got ${controllers}`)
 })
 
 test('charges the cycles ledger for what it created', async () => {
