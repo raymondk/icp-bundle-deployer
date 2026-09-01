@@ -15,7 +15,7 @@
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import { Principal } from '@icp-sdk/core/principal'
 import type { PluginRequest } from '../wasm/deployer'
-import { createCanisterCall } from './canister-call'
+import { createCanisterImports } from './canister'
 import { supportsJspi, transpilePlugin } from './transpile'
 import { createSandbox, selectImports } from './wasi'
 
@@ -24,21 +24,40 @@ export { SandboxError } from './wasi'
 
 export class SyncError extends Error {}
 
-/** The shape the plugin's `exec` export expects. */
-interface SyncExecInput {
+/** What both versions of the interface hand `exec`. */
+interface CommonExecInput {
   canisterId: string
   environment: string
-  dirs: string[]
-  files: { name: string; content: string }[]
   identityPrincipal: string
   proxyCanisterId?: string
+}
+
+/**
+ * The v0.1.0 shape: directories are bare paths, files carry no key, and there is
+ * no field, canister table, or call target anywhere in it.
+ */
+interface SyncExecInputV1 extends CommonExecInput {
+  dirs: string[]
+  files: { name: string; content: string }[]
+}
+
+/**
+ * The v0.2.0 shape: every declared path keeps the key it was written under, and
+ * the plugin is additionally handed the step's fields and the names of every
+ * canister the deployment created.
+ */
+interface SyncExecInputV2 extends CommonExecInput {
+  dirs: { key?: string; path: string }[]
+  files: { key?: string; name: string; content: string }[]
+  fields: { name: string; value: string }[]
+  canisterIds: { name: string; id: string }[]
 }
 
 interface PluginModule {
   instantiate: (
     getCoreModule: (path: string) => Promise<WebAssembly.Module>,
     imports: Record<string, unknown>,
-  ) => Promise<{ exec: (input: SyncExecInput) => Promise<void> }>
+  ) => Promise<{ exec: (input: SyncExecInputV1 | SyncExecInputV2) => Promise<void> }>
 }
 
 /**
@@ -61,8 +80,8 @@ export function createPluginRunner(
     const canisterId = Principal.fromText(request.canisterId)
     const { js, cores, imports: required } = await transpilePlugin(request.wasm)
     const sandbox = await createSandbox({
-      tree: request.tree,
-      canisterCall: createCanisterCall(agent, canisterId),
+      mounts: request.mounts,
+      canister: createCanisterImports({ agent, canisterId, callable: request.callable }),
       onOutput: request.onOutput,
     })
 
@@ -79,17 +98,46 @@ export function createPluginRunner(
         selectImports(sandbox, required),
       )
 
-      await instance.exec({
-        canisterId: request.canisterId,
-        environment: request.environment,
-        dirs: request.dirs,
-        files: request.files,
-        identityPrincipal: identityPrincipal.toText(),
-        proxyCanisterId: undefined,
-      })
+      await instance.exec(execInput(request, identityPrincipal))
     } finally {
       sandbox.dispose()
     }
+  }
+}
+
+/**
+ * What `exec` is handed, in the shape the plugin's own interface version
+ * declares. A v0.1.0 plugin is given the paths without their keys and told
+ * nothing about the step's fields or the deployment's other canisters — it has
+ * nowhere to put any of it, and this is the same reduction icp-cli makes.
+ */
+function execInput(
+  request: PluginRequest,
+  identityPrincipal: Principal,
+): SyncExecInputV1 | SyncExecInputV2 {
+  const common: CommonExecInput = {
+    canisterId: request.canisterId,
+    environment: request.environment,
+    identityPrincipal: identityPrincipal.toText(),
+    // A proxy is something the CLI is given on the command line; a browser
+    // deployment has none, so every call the plugin makes goes direct.
+    proxyCanisterId: undefined,
+  }
+
+  if (request.abi === 'v1') {
+    return {
+      ...common,
+      dirs: request.dirs.map((dir) => dir.path),
+      files: request.files.map(({ name, content }) => ({ name, content })),
+    }
+  }
+
+  return {
+    ...common,
+    dirs: request.dirs,
+    files: request.files,
+    fields: request.fields,
+    canisterIds: request.canisterIds,
   }
 }
 

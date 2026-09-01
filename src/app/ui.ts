@@ -227,7 +227,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     }
     if (result.incomplete.length > 0) {
       sections.push(
-        `<p class="warn">Created but not installed: ${result.incomplete
+        `<p class="warn">Created but not finished: ${result.incomplete
           .map(({ name, canisterId }) => `${escapeHtml(name)} (${escapeHtml(canisterId.toText())})`)
           .join(', ')}. They exist and are controlled by you.</p>`,
       )

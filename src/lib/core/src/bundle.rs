@@ -14,7 +14,7 @@ use icp_deploy_canister::{
     Canister, Project, bundle_get_canister_module_path,
     canister::recipe::NoResolve,
     manifest::{
-        BuildStep, PROJECT_MANIFEST, ProjectManifest, SyncStep, load_manifest,
+        BuildStep, PROJECT_MANIFEST, ProjectManifest, SyncStep, load_manifest, plugin::NamedPaths,
         prebuilt::SourceField,
     },
     prelude::*,
@@ -23,8 +23,10 @@ use icp_deploy_canister::{
 use sha2::{Digest, Sha256};
 
 use crate::{
+    abi::plugin_abi,
     archive::read_archive,
     files::{BundleFiles, ROOT, normalize},
+    sandbox::{Escape, covering_dirs},
 };
 
 /// Why a bundle was refused. The three kinds are worth telling apart: an archive
@@ -106,23 +108,20 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
         .await
         .map_err(|e| BundleError::manifest(chain(&e)))?;
 
-    if !manifest.dependencies.is_empty() {
-        return Err(BundleError::manifest(
-            "This bundle declares project dependencies, which this deployer cannot resolve. Only \
-             self-contained bundles are supported.",
-        ));
-    }
-    if manifest.canisters.is_empty() {
-        return Err(BundleError::manifest(format!(
-            "{PROJECT_MANIFEST} declares no canisters."
-        )));
-    }
-
     // Nothing in a bundle is fetched: recipes and plugin wasms must already be
     // in the archive, so the resolver only ever serves what is.
     let project = consolidate_manifest(&files, root, &NoResolve(files.clone()), &manifest)
         .await
         .map_err(|e| BundleError::manifest(chain(&e)))?;
+
+    // Asked of the workspace rather than of the root manifest: an umbrella
+    // project declares no canisters of its own and exists to pull together the
+    // ones its dependencies declare.
+    if project.canisters.is_empty() {
+        return Err(BundleError::manifest(
+            "This bundle declares no canisters, so there is nothing to deploy.",
+        ));
+    }
 
     // Script steps shell out, which a browser cannot do. This is the crate's own
     // sandbox rule, so a bundle refused here would be refused by any sandboxed
@@ -131,7 +130,7 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
 
     let mut canisters = Vec::new();
     for (name, (canister_dir, canister)) in &project.canisters {
-        canisters.push(check_canister(&files, name, canister_dir, canister).await?);
+        canisters.push(check_canister(&files, &project, name, canister_dir, canister).await?);
     }
 
     // An environment may override a canister's init args, so every variant a
@@ -168,6 +167,7 @@ pub fn artifact_path(canister_dir: &Path, canister: &Canister) -> Result<PathBuf
 
 async fn check_canister(
     files: &BundleFiles,
+    project: &Project,
     name: &str,
     canister_dir: &Path,
     canister: &Canister,
@@ -216,30 +216,51 @@ async fn check_canister(
             &sha256_hex(plugin),
             &format!("the sync plugin of canister \"{name}\""),
         )?;
+        // Which interface it speaks decides how it is called at all, so a plugin
+        // this deployer could not drive is refused now rather than after the
+        // canister it syncs is already installed.
+        plugin_abi(plugin).map_err(|e| {
+            BundleError::manifest(format!(
+                "The sync plugin of canister \"{name}\" cannot be run: {}.",
+                chain(&e)
+            ))
+        })?;
 
-        for dir in adapter.dirs.iter().flatten() {
-            let path = normalize(&base.join(dir));
-            // A plugin sees the canister's own directory and nothing above it, so
-            // a directory outside it has no path the plugin could resolve — and
-            // would otherwise be mounted somewhere it never looks.
-            if !path.starts_with(&base) {
+        // Every canister the step wants to reach has to be one this bundle
+        // deploys. An environment may leave some of them out, which only the
+        // deployment can know; a name the project never declares is wrong now.
+        for target in adapter.canisters.iter().flatten() {
+            if !names_a_canister(project, name, target) {
                 return Err(BundleError::manifest(format!(
-                    "Canister \"{name}\" declares \"{dir}\" for syncing, which is outside the \
-                     canister's own directory. A sync plugin only ever sees that directory, so \
-                     there is nowhere to give it these files."
+                    "The sync plugin of canister \"{name}\" lists \"{target}\" among the canisters \
+                     it may call, but this bundle declares no canister by that name."
                 )));
             }
+        }
+
+        let declared: Vec<&str> = adapter
+            .dirs
+            .iter()
+            .flat_map(NamedPaths::entries)
+            .map(|entry| entry.path)
+            .collect();
+        for dir in &declared {
+            let path = resolve_declared(&base, dir, name, "declares", "for syncing")?;
             if files.under(&path).is_empty() {
                 return Err(BundleError::manifest(format!(
                     "Canister \"{name}\" declares \"{dir}\" for syncing, but the bundle contains \
                      no files under that path."
                 )));
             }
-            sync_dirs.push(dir.clone());
         }
+        // The declared list is configuration — the same tree may be named twice,
+        // or beside a subtree of itself — but what gets uploaded is the trees
+        // behind it, which is what is worth reporting.
+        sync_dirs.extend(covering_dirs(declared).into_iter().map(str::to_owned));
 
-        for file in adapter.files.iter().flatten() {
-            let path = normalize(&base.join(file));
+        for entry in adapter.files.iter().flat_map(NamedPaths::entries) {
+            let file = entry.path;
+            let path = resolve_declared(&base, file, name, "passes", "to its sync plugin")?;
             let contents = read(
                 files,
                 &path,
@@ -263,6 +284,80 @@ async fn check_canister(
         declared_sha256,
         digest,
         sync_dirs,
+    })
+}
+
+/// Whether `target`, as the sync step of the canister keyed `syncing` spelled
+/// it, names a canister this bundle declares.
+///
+/// A step names a canister the way its own project names it, which is not always
+/// the key the workspace files it under. A project vendored into a workspace
+/// keeps writing `backend` for its own canister, and `vendor/ledger:ledger` for
+/// one belonging to a dependency of its own, while the workspace knows those as
+/// `services/crm:backend` and `services/crm/vendor/ledger:ledger` — the point
+/// being that vendoring a project does not rewrite its manifests. Deploying
+/// resolves both spellings against a table built this same way, so a name that
+/// passes here is one that will resolve there.
+fn names_a_canister(project: &Project, syncing: &str, target: &str) -> bool {
+    if project.canisters.contains_key(target) {
+        return true;
+    }
+    // A canister of the app root is already in the namespace store keys are
+    // relative to, so its project's spellings are the store keys.
+    let Some((namespace, _)) = syncing.rsplit_once(':') else {
+        return false;
+    };
+    project
+        .canisters
+        .keys()
+        .any(|key| member_relative_alias(namespace, key) == Some(target))
+}
+
+/// The name a canister has *within* the subproject at `namespace`: its store key
+/// with that subproject's prefix removed. A canister of the subproject itself
+/// comes back under its bare local name; one belonging to a subproject nested
+/// below it comes back under the key it would have if that subproject were the
+/// app root. `None` for a canister the subproject has no name of its own for.
+///
+/// A local name never contains a colon but a subproject directory may, so a key
+/// splits on its *last* colon.
+fn member_relative_alias<'a>(namespace: &str, key: &'a str) -> Option<&'a str> {
+    let (key_namespace, _) = key.rsplit_once(':')?;
+    let rest = key.strip_prefix(namespace)?;
+    match key_namespace == namespace {
+        // The colon separating the subproject from a local name of its own.
+        true => rest.strip_prefix(':'),
+        // Otherwise the key's subproject must sit *below* this one. Demanding
+        // the path separator is what keeps `services/crm-legacy:backend` out of
+        // `services/crm`, which it merely shares a spelling prefix with.
+        false => rest.strip_prefix('/'),
+    }
+}
+
+/// Resolve a path a sync step declared, or refuse the bundle for it.
+///
+/// The entry is written relative to the canister's own directory but resolved
+/// inside the bundle, so it may name a sibling canister's tree with `..`. What
+/// it may not do is leave the bundle: the plugin runs against the bundle's
+/// contents and nothing else exists to give it. `verb` and `role` place the
+/// entry in the sentence — "declares … for syncing", "passes … to its sync
+/// plugin".
+fn resolve_declared(
+    base: &Path,
+    declared: &str,
+    name: &str,
+    verb: &str,
+    role: &str,
+) -> Result<PathBuf, BundleError> {
+    crate::sandbox::resolve(base, declared).map_err(|escape| {
+        let reason = match escape {
+            Escape::NotRelative => "is an absolute path",
+            Escape::AboveRoot => "reaches outside the bundle",
+        };
+        BundleError::manifest(format!(
+            "Canister \"{name}\" {verb} \"{declared}\" {role}, which {reason}. A sync plugin sees \
+             what the bundle carries and nothing else."
+        ))
     })
 }
 
@@ -346,4 +441,71 @@ pub fn chain(error: &dyn std::error::Error) -> String {
         source = current.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_relative_alias;
+
+    /// A canister of the subproject itself is named bare within it.
+    #[test]
+    fn a_subprojects_own_canister_is_named_bare() {
+        assert_eq!(
+            member_relative_alias("services/crm", "services/crm:backend"),
+            Some("backend")
+        );
+    }
+
+    /// One belonging to a subproject nested below it keeps the key it would have
+    /// if that subproject were the app root — the very key its own manifest
+    /// writes, which is what lets vendoring leave those manifests alone.
+    #[test]
+    fn a_nested_subprojects_canister_is_named_relative_to_the_subproject() {
+        assert_eq!(
+            member_relative_alias("services/crm", "services/crm/vendor/ledger:ledger"),
+            Some("vendor/ledger:ledger")
+        );
+        assert_eq!(
+            member_relative_alias(
+                "services/crm",
+                "services/crm/vendor/ledger/vendor/util:util"
+            ),
+            Some("vendor/ledger/vendor/util:util")
+        );
+    }
+
+    /// A subproject whose path merely starts with the same characters is not
+    /// nested below this one, so it has no name here.
+    #[test]
+    fn a_spelling_prefix_is_not_nesting() {
+        assert_eq!(
+            member_relative_alias("services/crm", "services/crm-legacy:backend"),
+            None
+        );
+    }
+
+    /// A canister of the app root, or of an unrelated subproject, is not
+    /// something this subproject has a name of its own for.
+    #[test]
+    fn an_unrelated_canister_has_no_name_here() {
+        assert_eq!(member_relative_alias("services/crm", "backend"), None);
+        assert_eq!(
+            member_relative_alias("services/crm", "services/other:backend"),
+            None
+        );
+    }
+
+    /// A subproject directory may itself contain a colon, so a key splits on its
+    /// last one — and a colon in a directory name is not nesting.
+    #[test]
+    fn keys_split_at_the_last_colon() {
+        assert_eq!(
+            member_relative_alias("services/odd:name", "services/odd:name:frontend"),
+            Some("frontend")
+        );
+        assert_eq!(
+            member_relative_alias("services/odd", "services/odd:name:frontend"),
+            None
+        );
+    }
 }

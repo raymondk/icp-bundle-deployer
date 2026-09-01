@@ -14,9 +14,11 @@
 //! whose values are neither `Send` nor `Sync`, which only holds together on a
 //! single-threaded target — and is compiled for wasm alone.
 
+pub mod abi;
 pub mod archive;
 pub mod bundle;
 pub mod files;
+pub mod sandbox;
 pub mod settings;
 
 #[cfg(target_family = "wasm")]

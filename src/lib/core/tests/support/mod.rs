@@ -4,6 +4,30 @@
 use std::io::Write;
 
 use flate2::{Compression, write::GzEncoder};
+use wasm_encoder::{
+    Component, ComponentImportSection, ComponentTypeRef, ComponentTypeSection, InstanceType,
+};
+
+/// A sync plugin, as far as anything the bundle checks can tell: a component
+/// declaring the `icp:sync-plugin/types` instance of `version`, which is where
+/// the interface version is read from. It exports no `exec` and holds no code —
+/// nothing here runs one, and what a plugin has to *be* to be accepted is
+/// exactly this much.
+pub fn plugin(version: &str) -> Vec<u8> {
+    let mut types = ComponentTypeSection::new();
+    types.instance(&InstanceType::new());
+
+    let mut imports = ComponentImportSection::new();
+    imports.import(
+        format!("icp:sync-plugin/types@{version}"),
+        ComponentTypeRef::Instance(0),
+    );
+
+    let mut component = Component::new();
+    component.section(&types);
+    component.section(&imports);
+    component.finish()
+}
 
 pub struct Entry {
     pub name: String,

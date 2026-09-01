@@ -6,12 +6,24 @@
  * we do that here at runtime rather than shipping a pre-transpiled copy — so a
  * bundle built against any plugin release deploys without changing this app.
  *
- * `canister-call` is declared synchronous in the plugin's world, but talking to a
- * replica is asynchronous. JSPI bridges that: the import is marked async, and the
- * generated glue suspends the wasm stack while the promise settles.
+ * The plugin's host imports are declared synchronous in its world, but talking to
+ * a replica is asynchronous. JSPI bridges that: those imports are marked async,
+ * and the generated glue suspends the wasm stack while the promise settles.
+ *
+ * Every version of the interface names its host functions the same way, so the
+ * lowering here is the same for all of them. What differs is the shape of what
+ * `exec` is handed, and the module has already read that off the component and
+ * says so in the request.
  */
 
 import { sha256Hex } from '../wasm/deployer'
+
+/** The host functions the plugin's world may import, all of them async. */
+const HOST_IMPORTS = [
+  'canister-call',
+  'canister-metadata-section',
+  'canister-set-environment-variable',
+]
 
 export interface TranspiledPlugin {
   /** Self-contained ES module source exporting `instantiate`. */
@@ -64,7 +76,7 @@ async function generate(wasm: Uint8Array): Promise<TranspiledPlugin> {
       // Hand every import in at instantiation instead of letting the glue import
       // modules by name — there is no module resolver for them in the browser.
       instantiation: { tag: 'async' },
-      asyncMode: { tag: 'jspi', val: { imports: ['canister-call'], exports: ['exec'] } },
+      asyncMode: { tag: 'jspi', val: { imports: HOST_IMPORTS, exports: ['exec'] } },
       validLiftingOptimization: false,
       tracing: false,
       noNodejsCompat: true,

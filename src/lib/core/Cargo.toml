@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The deployment core icp-cli itself uses. Everything it abstracts behind a trait
 # — the filesystem, the ICP API, sync-plugin execution — is supplied by the host.
-icp-deploy-canister = { git = "https://github.com/dfinity/icp-cli", rev = "d9619c7b2f9d98830817d7003f3a80296ab7469d" }
+icp-deploy-canister = { git = "https://github.com/dfinity/icp-cli", rev = "146734d12970cf22b9a5a230899ac2e8deeabaa7" }
 
 async-trait = "0.1.88"
 camino = "1.1.9"
@@ -27,9 +27,11 @@ snafu = "0.9.0"
 tar = { version = "0.4.46", default-features = false }
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
+wasmparser = { version = "0.258.0", default-features = false, features = ["component-model"] }
 
 [dev-dependencies]
 # Loading a bundle is only nominally async — nothing it reads can block — so a
 # bare executor is all the tests need to drive it.
 futures = "0.3.31"
 indoc = "2.0.6"
+wasm-encoder = "0.258"

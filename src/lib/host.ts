@@ -7,9 +7,10 @@
  * deployment starts and cannot change during one.
  */
 
-import { Certificate, lookupResultToBuffer, type HttpAgent } from '@icp-sdk/core/agent'
+import type { HttpAgent } from '@icp-sdk/core/agent'
 import { Principal } from '@icp-sdk/core/principal'
 import type { DeployEvent } from './events'
+import { readMetadata } from './ic/metadata'
 import { createPlacement } from './ic/placement'
 import { createPluginRunner } from './plugin'
 import type { DeployerHost } from './wasm/deployer'
@@ -63,32 +64,4 @@ export function createHost({
 
     runPlugin,
   }
-}
-
-/**
- * A canister's custom-section metadata, read through `read_state` and checked
- * against the network's root key. Absent metadata is `undefined` rather than an
- * error — that is the answer to "does this canister declare it?".
- */
-async function readMetadata(
-  agent: HttpAgent,
-  canisterId: Principal,
-  name: string,
-): Promise<Uint8Array | undefined> {
-  const encoder = new TextEncoder()
-  const path = [
-    encoder.encode('canister'),
-    canisterId.toUint8Array(),
-    encoder.encode('metadata'),
-    encoder.encode(name),
-  ]
-
-  const { certificate } = await agent.readState(canisterId, { paths: [path] })
-  const verified = await Certificate.create({
-    certificate,
-    rootKey: agent.rootKey!,
-    principal: { canisterId },
-    agent,
-  })
-  return lookupResultToBuffer(verified.lookup_path(path))
 }

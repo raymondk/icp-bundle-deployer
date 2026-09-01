@@ -22,12 +22,13 @@ import {
 } from '../src/lib'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { createTar, gzip, type TarFile } from './support/tar'
+import { syncPlugin } from './support/plugin'
 import { loadModule } from './support/wasm'
 
 await loadModule()
 
 const WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
-const PLUGIN = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x01])
+const PLUGIN = syncPlugin('0.1.0')
 
 const wasmDigest = await sha256Hex(WASM)
 const pluginDigest = await sha256Hex(PLUGIN)

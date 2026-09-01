@@ -22,10 +22,12 @@ use snafu::Snafu;
 use wasm_bindgen::prelude::*;
 
 use crate::{
+    abi::plugin_abi,
     bundle::sha256_hex,
     events::ProgressSink,
     files::{BundleFiles, normalize},
     host::Host,
+    sandbox::{covering_dirs, resolve},
 };
 
 #[derive(Debug, Snafu)]
@@ -55,10 +57,13 @@ pub enum PluginError {
     NotText { path: PathBuf },
 
     #[snafu(display(
-        "the directory '{dir}' the step syncs is outside the canister's own directory, which is \
-         everything the plugin can see"
+        "the step declares '{declared}', which reaches outside the bundle — everything the plugin \
+         can see"
     ))]
-    Escapes { dir: String },
+    Outside { declared: String },
+
+    #[snafu(display("the plugin cannot be run: {source}"))]
+    Abi { source: crate::abi::AbiError },
 
     #[snafu(display("{message}"))]
     Host { message: String },
@@ -102,8 +107,10 @@ impl PluginExecutor for JsPluginExecutor<'_> {
 
 impl JsPluginExecutor<'_> {
     async fn run(&self, invocation: PluginInvocation) -> Result<(), PluginError> {
-        // The sandbox is rooted at the canister's own directory, so every path
-        // the plugin resolves is relative to it, exactly as under icp-cli.
+        // Declared paths are written relative to the canister's own directory
+        // and resolved inside the project. A bundle's project directory is the
+        // archive root — `invocation.project_dir` is always it — so confining to
+        // the root, which is all `resolve` can do, is the rule icp-cli applies.
         let base = normalize(&invocation.base_dir);
 
         let SourceField::Local(source) = &invocation.source else {
@@ -126,30 +133,54 @@ impl JsPluginExecutor<'_> {
             }
         }
 
-        // The plugin resolves what it reads against the sandbox root, so a
-        // directory outside the base has no key it would ever look under. The
-        // bundle is refused for this at load time; a plugin invocation that gets
-        // here anyway must not silently sync nothing.
-        let tree = Map::new();
-        for dir in &invocation.dirs {
-            let root = normalize(&base.join(dir));
-            if !root.starts_with(&base) {
-                return Err(PluginError::Escapes { dir: dir.clone() });
-            }
+        // Which interface the plugin speaks decides the shape of everything
+        // below it, so it is settled before any of that is assembled. The bundle
+        // was refused at load time for one this deployer cannot drive.
+        let abi = plugin_abi(wasm).map_err(|source| PluginError::Abi { source })?;
+
+        // The plugin is told about every declared directory, key and all, but
+        // only the trees not already covered by another entry are mounted:
+        // naming a directory twice, or naming one inside another's, conveys no
+        // further access. Each mount is placed at the spelling the manifest
+        // wrote, which is the path the plugin will open it at.
+        let dirs = Array::new();
+        for entry in &invocation.dirs {
+            let dir = Object::new();
+            set(&dir, "key", &optional(entry.key.as_deref()));
+            set(&dir, "path", &JsValue::from_str(&entry.path));
+            dirs.push(&dir);
+        }
+
+        let mounts = Map::new();
+        let declared = invocation.dirs.iter().map(|entry| entry.path.as_str());
+        for dir in covering_dirs(declared) {
+            // The bundle is refused at load time for a directory that reaches
+            // out of it; an invocation that gets here anyway must not silently
+            // sync nothing.
+            let root = resolve(&base, dir).map_err(|_| PluginError::Outside {
+                declared: dir.to_owned(),
+            })?;
+            let tree = Map::new();
             for (entry, contents) in self.files.under(&root) {
                 let relative = entry
-                    .strip_prefix(&base)
-                    .expect("an entry under the base is relative to it");
+                    .strip_prefix(&root)
+                    .expect("an entry under the mount is relative to it");
                 tree.set(
                     &JsValue::from_str(relative.as_str()),
                     &Uint8Array::from(contents),
                 );
             }
+            mounts.set(&JsValue::from_str(dir), &tree);
         }
 
+        // Files are passed inline, one entry per declaration: two keys naming
+        // the same file are two entries, because the key is what the plugin
+        // looks the file up by.
         let files = Array::new();
-        for name in &invocation.files {
-            let path = normalize(&base.join(name));
+        for entry in &invocation.files {
+            let path = resolve(&base, &entry.path).map_err(|_| PluginError::Outside {
+                declared: entry.path.clone(),
+            })?;
             let contents = self
                 .files
                 .get(&path)
@@ -158,9 +189,36 @@ impl JsPluginExecutor<'_> {
                 .map_err(|_| PluginError::NotText { path: path.clone() })?;
 
             let file = Object::new();
-            set(&file, "name", &JsValue::from_str(name));
+            set(&file, "key", &optional(entry.key.as_deref()));
+            set(&file, "name", &JsValue::from_str(&entry.path));
             set(&file, "content", &JsValue::from_str(content));
             files.push(&file);
+        }
+
+        let fields = Array::new();
+        for (name, value) in &invocation.fields {
+            let field = Object::new();
+            set(&field, "name", &JsValue::from_str(name));
+            set(&field, "value", &JsValue::from_str(value));
+            fields.push(&field);
+        }
+
+        // Every canister the deployment named, so a plugin can resolve the ones
+        // it knows about — and separately, the ones the step listed, which are
+        // the only ones it is allowed to reach.
+        let canister_ids = Array::new();
+        for (name, canister_id) in &invocation.canister_ids {
+            let entry = Object::new();
+            set(&entry, "name", &JsValue::from_str(name));
+            set(&entry, "id", &JsValue::from_str(&canister_id.to_text()));
+            canister_ids.push(&entry);
+        }
+        let callable = Map::new();
+        for (name, canister_id) in &invocation.callable {
+            callable.set(
+                &JsValue::from_str(name),
+                &JsValue::from_str(&canister_id.to_text()),
+            );
         }
 
         // Kept alive across the call, and dropped with it: the host must not
@@ -170,6 +228,7 @@ impl JsPluginExecutor<'_> {
 
         let request = Object::new();
         set(&request, "wasm", &Uint8Array::from(wasm));
+        set(&request, "abi", &JsValue::from_str(abi.as_str()));
         set(
             &request,
             "canisterId",
@@ -180,17 +239,12 @@ impl JsPluginExecutor<'_> {
             "environment",
             &JsValue::from_str(&invocation.environment),
         );
-        set(
-            &request,
-            "dirs",
-            &invocation
-                .dirs
-                .iter()
-                .map(|dir| JsValue::from_str(dir))
-                .collect::<Array>(),
-        );
+        set(&request, "dirs", &dirs);
         set(&request, "files", &files);
-        set(&request, "tree", &tree);
+        set(&request, "fields", &fields);
+        set(&request, "canisterIds", &canister_ids);
+        set(&request, "callable", &callable);
+        set(&request, "mounts", &mounts);
         set(
             &request,
             "onOutput",
@@ -206,4 +260,10 @@ impl JsPluginExecutor<'_> {
 /// Property assignment on a plain object we just created, which cannot fail.
 fn set(target: &Object, key: &str, value: &JsValue) {
     let _ = Reflect::set(target, &JsValue::from_str(key), value);
+}
+
+/// A WIT `option<string>`, which the generated bindings read as the value itself
+/// or `undefined`.
+fn optional(value: Option<&str>) -> JsValue {
+    value.map_or(JsValue::UNDEFINED, JsValue::from_str)
 }

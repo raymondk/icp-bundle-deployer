@@ -19,20 +19,72 @@ const DEPLOYER_HOST: &'static str = r#"
 /** Progress lines a sync plugin prints while it runs. */
 export type PluginOutput = (line: string) => void
 
+/**
+ * A directory the sync step declared. `key` is the name it was written under
+ * when `dirs` is a map, and `undefined` when it is a plain list.
+ */
+export interface PluginDir {
+  key?: string
+  /** Written relative to the canister directory; the path the plugin opens it at. */
+  path: string
+}
+
+/** A file the sync step declared, read up front and passed to the plugin inline. */
+export interface PluginFile {
+  key?: string
+  name: string
+  content: string
+}
+
+/** A `fields:` entry, passed to the plugin verbatim. */
+export interface PluginField {
+  name: string
+  value: string
+}
+
+/** A canister the plugin can resolve by name. */
+export interface PluginCanisterId {
+  name: string
+  id: string
+}
+
 /** A fully-resolved sync-plugin step, ready for the jco adapter to run. */
 export interface PluginRequest {
   /** The plugin component, verified against the digest the manifest declared. */
   wasm: Uint8Array
-  /** The canister the plugin may call, and only it. */
+  /**
+   * Which version of the `icp:sync-plugin` interface this plugin was built
+   * against, read off the instance its component declares. The two differ in
+   * what `exec` is handed, so the adapter has to be told rather than guess: a
+   * component declares only the host functions it calls, which says nothing
+   * about the interface it speaks.
+   */
+  abi: 'v1' | 'v2'
+  /** The canister being synced, which the plugin may always reach. */
   canisterId: string
   /** Environment name the plugin is told about; informational to it. */
   environment: string
-  /** Directories preopened read-only, at the paths the plugin resolves them at. */
-  dirs: string[]
+  /** Every declared directory, in written order, keys and all. */
+  dirs: PluginDir[]
   /** Files the host read up front and passes inline. */
-  files: { name: string; content: string }[]
-  /** Contents of everything under `dirs`, keyed by the path the plugin sees. */
-  tree: Map<string, Uint8Array>
+  files: PluginFile[]
+  /** Key-value fields the step declared. */
+  fields: PluginField[]
+  /** Every canister this deployment named, for the plugin to resolve against. */
+  canisterIds: PluginCanisterId[]
+  /**
+   * The canisters the step's `canisters:` list named, by name. These, plus
+   * `canisterId`, are the only ones a plugin may call; anything else must be
+   * refused rather than reached.
+   */
+  callable: Map<string, string>
+  /**
+   * What to mount read-only, and where. Keyed by the path the plugin opens the
+   * directory at — the spelling the manifest used — and holding that tree's
+   * files by their path within it. A directory already covered by another entry
+   * has no mount of its own and is read through the one covering it.
+   */
+  mounts: Map<string, Map<string, Uint8Array>>
   onOutput: PluginOutput
 }
 
