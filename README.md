@@ -72,6 +72,15 @@ The library runs anywhere an agent does; the e2e suite drives it from Node. Only
 sync step is browser-shaped, needing WebAssembly JSPI — `supportsJspi()` says whether
 this host has it.
 
+Outside a browser or a bundler, `initialize` has to be handed the library's WebAssembly
+module: it is otherwise resolved from alongside the library and fetched, and a plain Node
+process cannot fetch a `file:` URL.
+
+```ts
+import { initialize } from './lib'
+await initialize(await readFile('src/lib/wasm/deployer_bg.wasm'))
+```
+
 ## What it does
 
 1. **Reads the bundle** — gunzips and unpacks the tar, parses `icp.yaml`, and hashes every
@@ -92,12 +101,18 @@ this host has it.
 6. **Runs the bundle's sync plugin** — see below. Assets are uploaded by the same wasm
    `icp sync` runs.
 7. **Hands over control** — controllers are applied last, so the deployer keeps control of
-   each canister while it is still setting it up.
+   each canister while it is still setting it up. Whoever the manifest names is *added* to
+   the controllers rather than replacing them, so the identity that paid for a canister
+   never loses access to it — the same thing `icp deploy` leaves behind.
 
 Those are phases, not a per-canister loop, and the order matters: every canister is created
-before any wasm is installed. If a phase fails the run stops and the page reports which
-canisters exist but are unfinished, so nothing is silently abandoned — they exist and you
-control them.
+before any wasm is installed, and every wasm is installed before any sync runs. The second
+separation is there because a sync plugin may call the canisters its step lists, and one
+that ran between installs would be calling a canister with nothing in it yet.
+`icp-deploy-canister` installs and syncs a canister together, so this is the one place the
+deployer drives its pieces rather than its whole. If a phase fails the run stops and the
+page reports which canisters exist but are unfinished, so nothing is silently abandoned —
+they exist and you control them.
 
 ## Choosing a subnet
 
@@ -160,29 +175,54 @@ a CLI deployment instead of approximating it:
 
 - **jco's bindgen lowers the component to JavaScript at runtime**, in the page. Nothing is
   pinned to a plugin version — a bundle built against any release deploys as-is.
-- **`preview2-shim` provides the WASI world** with an in-memory filesystem holding only the
-  directories the manifest declared, mirroring the read-only preopen sandbox icp-cli gives
-  a plugin. There is no network and no writable filesystem inside it.
-- **`canister-call`, the plugin's one non-WASI import, is backed by agent-js** and fixed to
-  the canister being synced, exactly as the CLI host fixes it.
-- The plugin's own progress output is piped into the deployment log.
+- **Both versions of the `icp:sync-plugin` interface are driven**, 0.1.0 and 0.2.0, chosen
+  by reading the version off the component's own declared imports. That is how icp-cli
+  chooses too, and it is the only reliable signal: a component declares just the host
+  functions it calls, so which ones it asks for says nothing about which interface it
+  speaks.
+- **`preview2-shim` provides the WASI world**, with each declared directory preopened
+  read-only at the path the manifest wrote it as — the same paths, and the same read-only
+  preopen sandbox, icp-cli gives a plugin. There is no network and no writable filesystem
+  inside it.
+- **The plugin's non-WASI imports are backed by agent-js**: calling a canister, reading a
+  metadata section off one, and setting one of its environment variables. Which canister
+  each reaches is not the plugin's to choose freely — the canister being synced, or one the
+  sync step listed in `canisters:`, and anything else is refused without a call.
+- The plugin's own progress output is piped into the deployment log, a line at a time.
 
-That last import is declared *synchronous*, and a browser cannot block on a network round
+Those imports are declared *synchronous*, and a browser cannot block on a network round
 trip. The bridge is **WebAssembly JSPI**, which suspends the wasm stack until the call
 settles — shipped in Chrome 137+ and Edge, behind a flag in Firefox, in progress in Safari.
 On a browser without it the page says so up front; creating canisters and installing wasms
 are unaffected.
 
+A `dirs:`/`files:` entry is written relative to the canister's own directory but resolved
+inside the whole project, so it may rise out of that directory with `..` and name anything
+else the bundle carries. What it may not do is leave the bundle: nothing outside one exists
+to hand the plugin, and such an entry is refused at load time.
+
+There is no proxy canister in a browser — that is something the CLI is given on the command
+line — so every request a plugin makes takes the direct route, and the `direct` flag each
+one carries has nothing left to select.
+
 ## Scope
 
 Rejected before anything is deployed, each with a specific message: build steps that are
 not `pre-built`, wasms or plugins referenced by URL instead of by path, `script` sync steps
-(a browser has no shell), project dependencies, and init args in Candid *text* format
-(which needs an encoder the browser doesn't have — use `format: hex` or `format: bin`).
+(a browser has no shell), and sync plugins built against an interface version this deployer
+has no bindings for.
+
+A bundle built from a workspace carries its dependencies too — the root project at the
+archive root and each dependency at the directory it sits in relative to that root — and
+the whole workspace deploys, because a dependency's canisters may call each other. Those
+canisters are keyed by where the dependency sits, so `vendor/lib:backend` is a different
+canister from the root's own `backend`.
 
 ## Run it
 
-Requires [icp-cli](https://cli.internetcomputer.org/) 1.x and Node.js.
+Requires [icp-cli](https://cli.internetcomputer.org/) 1.x and Node.js, plus a Rust
+toolchain with the `wasm32-unknown-unknown` target and
+[`wasm-pack`](https://drager.github.io/wasm-pack/) to build the library's Rust core.
 
 ```bash
 npm install
@@ -218,9 +258,11 @@ npm run test:e2e # deploys a real bundle to the local network
 
 The offline suite builds tar archives in memory, so it needs no fixtures and no
 network. Most of its cases assert a *refusal* — a script build step, a wasm or plugin
-referenced by URL, a tampered digest, Candid-text init args — because those decide
-whether a deployment starts at all, and the point is that a bad bundle is rejected
-before any canister exists.
+referenced by URL, a tampered digest — because those decide whether a deployment starts
+at all, and the point is that a bad bundle is rejected before any canister exists. Those
+cases live in `src/lib/core`, which `npm test` runs with `cargo test` before the
+TypeScript suite checks that a refusal reaches a caller as the error class it can branch
+on.
 
 The e2e suite needs a running local network (`icp network start -d`). It builds a
 two-canister bundle from the published certified-assets release (cached under
@@ -235,10 +277,12 @@ IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
 |---|---|
 | `src/lib/index.ts` | the library's public API — everything below is reached through it |
 | `src/lib/deployer.ts` | `createDeployer`: binds an agent, resolves what the caller left out |
-| `src/lib/bundle/` | archive reader, manifest parsing and validation, integrity checks |
-| `src/lib/ic/` | canister creation, wasm install, subnet resolution, cloud engines |
-| `src/lib/sync/` | plugin transpilation, the WASI sandbox, the `canister-call` bridge |
-| `src/lib/deploy.ts` | phased orchestration with progress events |
+| `src/lib/bundle.ts` | loading a bundle, and the errors a bad one raises |
+| `src/lib/host.ts` | what the core calls out to: agent-js, canister creation, plugins |
+| `src/lib/ic/` | canister creation, placement, metadata and settings reads and writes |
+| `src/lib/plugin/` | plugin transpilation, the WASI sandbox, the plugin's canister imports |
+| `src/lib/core/` | the Rust core: the archive, the manifest, phased orchestration |
+| `src/lib/wasm/` | the compiled core, generated by `npm run build:lib` |
 | `src/app/` | the page: network detection, Internet Identity, UI |
 | `test/` | the offline and e2e suites |
 

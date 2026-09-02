@@ -1,14 +1,15 @@
 {
-  "name": "vite-project",
+  "name": "icp-bundle-deployer",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "build:lib": "wasm-pack build src/lib/core --target web --out-dir ../wasm --out-name deployer --no-pack --release",
+    "dev": "npm run build:lib && vite",
+    "build": "npm run build:lib && tsc && vite build",
     "preview": "vite preview",
-    "test": "tsc -p tsconfig.test.json && tsx test/offline.test.ts",
-    "test:e2e": "tsc -p tsconfig.test.json && tsx --import ./test/support/register-shim.mjs --experimental-wasm-jspi test/e2e.test.ts"
+    "test": "npm run build:lib && cargo test --manifest-path src/lib/core/Cargo.toml && tsc -p tsconfig.test.json && tsx test/offline.test.ts",
+    "test:e2e": "npm run build:lib && tsc -p tsconfig.test.json && tsx --import ./test/support/register-shim.mjs --experimental-wasm-jspi test/e2e.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
@@ -22,10 +23,7 @@
   "dependencies": {
     "@bytecodealliance/jco-transpile": "^0.7.0",
     "@bytecodealliance/preview2-shim": "^0.20.1",
-    "@dfinity/utils": "^4.2.1",
     "@icp-sdk/auth": "^8.0.3",
-    "@icp-sdk/canisters": "^3.6.0",
-    "@icp-sdk/core": "^5.4.0",
-    "yaml": "^2.9.0"
+    "@icp-sdk/core": "^5.4.0"
   }
 }

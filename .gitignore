@@ -32,3 +32,7 @@ bundles/
 
 # cached release artifacts used by the e2e suite
 .cache/
+
+# Rust build output and the generated wasm module (rebuilt by `npm run build:lib`)
+/target
+src/lib/wasm/
