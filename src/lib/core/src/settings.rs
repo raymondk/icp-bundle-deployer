@@ -5,12 +5,14 @@
 //! one change that can lock the deployer out of a canister it is still setting
 //! up, so it happens once there is nothing left to do.
 //!
-//! Environment variables are in neither half — `icp-deploy-canister` writes them
-//! itself, merged with the canister ids it injects.
+//! Environment variables are in neither half — `icp-project` writes them itself,
+//! merged with the canister ids it injects.
 
 use candid::{Nat, Principal};
-use ic_management_canister_types::{CanisterSettings, LogVisibility, UpdateSettingsArgs};
-use icp_deploy_canister::{Canister, canister::resolve_controllers, ids::IdMapping};
+use ic_management_canister_types::{
+    CanisterSettings, LogVisibility, SnapshotVisibility, StatusVisibility,
+};
+use icp_project::{Canister, canister::resolve_controllers, store_id::IdMapping};
 
 /// Every setting the manifest declares except environment variables and
 /// controllers. `None` when the manifest declared none, so a canister with no
@@ -18,7 +20,15 @@ use icp_deploy_canister::{Canister, canister::resolve_controllers, ids::IdMappin
 pub fn configuration(canister: &Canister) -> Option<CanisterSettings> {
     let s = &canister.settings;
     let settings = CanisterSettings {
-        log_visibility: s.log_visibility.clone().map(LogVisibility::from),
+        log_visibility: s.log_visibility.clone().map(|v| LogVisibility::from(v.0)),
+        snapshot_visibility: s
+            .snapshot_visibility
+            .clone()
+            .map(|v| SnapshotVisibility::from(v.0)),
+        status_visibility: s
+            .status_visibility
+            .clone()
+            .map(|v| StatusVisibility::from(v.0)),
         compute_allocation: s.compute_allocation.map(Nat::from),
         memory_allocation: s.memory_allocation.as_ref().map(|m| Nat::from(m.get())),
         freezing_threshold: s.freezing_threshold.as_ref().map(|d| Nat::from(d.get())),
@@ -28,7 +38,7 @@ pub fn configuration(canister: &Canister) -> Option<CanisterSettings> {
         log_memory_limit: s.log_memory_limit.as_ref().map(|m| Nat::from(m.get())),
         controllers: None,
         environment_variables: None,
-        snapshot_visibility: None,
+        ..Default::default()
     };
 
     declares_anything(&settings).then_some(settings)
@@ -75,22 +85,11 @@ pub fn controllers(
     }))
 }
 
-/// The candid-encoded `update_settings` argument for a canister.
-pub fn update_settings_arg(
-    canister_id: Principal,
-    settings: CanisterSettings,
-) -> Result<Vec<u8>, String> {
-    candid::encode_one(UpdateSettingsArgs {
-        canister_id,
-        settings,
-        sender_canister_version: None,
-    })
-    .map_err(|e| format!("could not encode the settings: {e}"))
-}
-
 fn declares_anything(settings: &CanisterSettings) -> bool {
     let CanisterSettings {
         log_visibility,
+        snapshot_visibility,
+        status_visibility,
         compute_allocation,
         memory_allocation,
         freezing_threshold,
@@ -102,6 +101,8 @@ fn declares_anything(settings: &CanisterSettings) -> bool {
     } = settings;
 
     log_visibility.is_some()
+        || snapshot_visibility.is_some()
+        || status_visibility.is_some()
         || compute_allocation.is_some()
         || memory_allocation.is_some()
         || freezing_threshold.is_some()

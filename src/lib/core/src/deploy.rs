@@ -9,33 +9,47 @@
 //! and running. Interleaving the two would have the first canister's plugin
 //! calling one that is still empty.
 //!
-//! `icp-deploy-canister` does not impose that separation — its `deploy_canister`
-//! installs one canister and immediately syncs it — so the two halves are driven
-//! here, from the same crate's pieces.
+//! `icp-project`'s own `deploy` is built for a project on disk — it builds, it
+//! keeps an id store, it reports through a task tree — so the phases are driven
+//! here instead, out of the same crate's operations: the same environment
+//! variables, the same install, the same syncer.
 //!
 //! The bundle is validated and hashed before any of this runs, so a failure here
 //! means the network refused something. When that happens the run stops and
 //! reports which canisters exist but are not finished, so nothing is silently
 //! left behind.
 
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use candid::Principal;
-use icp_deploy_canister::{
-    Canister, InstallMode,
-    deploy::{apply_binding_env_vars, install_canister, run_sync_steps, start_canister},
-    ids::{IdStore, InMemoryIdStore},
-    network::Configuration,
-    prelude::*,
-    sync_exec::{NoScripts, SyncStepContext},
+use ic_management_canister_types::{
+    CanisterIdRecord, CanisterInstallMode, CanisterSettings, CanisterStatusType, UpdateSettingsArgs,
 };
+use icp_events::StepReporter;
+use icp_project::{
+    Canister, Environment,
+    calls::CanisterCalls,
+    canister::sync::{
+        Params, Syncer, Synchronize,
+        script::{ScriptInvocation, ScriptRunError, ScriptRunner},
+    },
+    error::flatten,
+    network::{Configuration, NetworkUrls},
+    operations::{
+        binding_env_vars::set_env_vars_for_canister, install::install_canister, proxy_management,
+    },
+    prelude::*,
+    store_id::IdMapping,
+};
+use snafu::Snafu;
 
 use crate::{
-    bundle::{LoadedBundle, artifact_path, chain},
+    bundle::{LoadedBundle, artifact_path},
     events::{DeployEvent, DeployResult, DeployedCanister, Emitter, ProgressSink},
     files::BundleFiles,
     host::Host,
-    plugin::JsPluginExecutor,
+    plugin::{BundleWasm, JsPluginRunner},
     settings,
 };
 
@@ -46,7 +60,7 @@ use crate::{
 /// caller about.
 pub async fn deploy(
     bundle: &LoadedBundle,
-    host: &Host,
+    host: &Arc<Host>,
     environment: &str,
     emitter: &Emitter,
 ) -> DeployResult {
@@ -75,10 +89,21 @@ pub async fn deploy(
         }
     }
 
-    // Which of the two id stores an implementation keeps; with one in-memory
-    // store it makes no difference, but the crate's API asks for the answer.
-    let is_cache = matches!(env.network.configuration, Configuration::Managed { .. });
-    let ids = InMemoryIdStore::default();
+    // Asked for up front: a sync plugin is told where the network is, and a
+    // host that cannot say so should fail the run before it has created
+    // anything.
+    let urls = match network_urls(host, env) {
+        Ok(urls) => urls,
+        Err(message) => return run.failed(message),
+    };
+
+    let calls: Arc<dyn CanisterCalls> = host.clone();
+
+    // Every id this deployment creates, under the key the environment files the
+    // canister by. This is what a canister is told about its neighbours and
+    // what a sync plugin resolves a call target against; icp-cli keeps the same
+    // table in a store on disk.
+    let mut canister_ids = IdMapping::new();
 
     // ── Create ────────────────────────────────────────────────────────────
     // Placement — the subnet, and whether a cloud engine's operator creates
@@ -98,9 +123,7 @@ pub async fn deploy(
             }
         };
 
-        if let Err(e) = ids.register(is_cache, environment, name, canister_id) {
-            return run.fail(emitter, name, chain(&e));
-        }
+        canister_ids.insert(name.clone(), canister_id);
         run.created.push(DeployedCanister {
             name: name.clone(),
             canister_id: canister_id.to_text(),
@@ -120,7 +143,7 @@ pub async fn deploy(
         let Some(configured) = settings::configuration(canister) else {
             continue;
         };
-        let canister_id = match id_of(&ids, is_cache, environment, name) {
+        let canister_id = match id_of(&canister_ids, name) {
             Ok(canister_id) => canister_id,
             Err(message) => return run.fail(emitter, name, message),
         };
@@ -129,7 +152,7 @@ pub async fn deploy(
             name: name.clone(),
             message: "Applying the settings the manifest declares…".to_owned(),
         });
-        if let Err(message) = update_settings(host, canister_id, configured).await {
+        if let Err(message) = update_settings(calls.as_ref(), canister_id, configured).await {
             return run.fail(
                 emitter,
                 name,
@@ -138,20 +161,13 @@ pub async fn deploy(
         }
     }
 
-    // Every id this deployment created, which is what a canister is told about
-    // its neighbours and what a sync plugin resolves a call target against. It
-    // is complete because the create phase is: nothing below adds a canister.
-    let canister_ids = ids
-        .lookup_by_environment(is_cache, environment)
-        .unwrap_or_default();
-
     // ── Install ───────────────────────────────────────────────────────────
     // Environment variables (the canister ids included), the wasm, then a
     // start — in that order, which is the crate's. Syncing is left to the phase
     // below; a canister has to be running before its assets go up, and every
     // *other* canister has to be running before a plugin may call one.
     for (name, (canister_dir, canister)) in &env.canisters {
-        let canister_id = match id_of(&ids, is_cache, environment, name) {
+        let canister_id = match id_of(&canister_ids, name) {
             Ok(canister_id) => canister_id,
             Err(message) => return run.fail(emitter, name, message),
         };
@@ -163,7 +179,7 @@ pub async fn deploy(
             Some(Ok(args)) => Some(args),
             // The bundle was refused at load time for init args that cannot be
             // encoded, so this is unreachable rather than a user's mistake.
-            Some(Err(e)) => return run.fail(emitter, name, chain(&e)),
+            Some(Err(e)) => return run.fail(emitter, name, flatten(&e)),
             None => None,
         };
 
@@ -173,7 +189,7 @@ pub async fn deploy(
         });
 
         let installed = install(
-            host,
+            calls.as_ref(),
             &bundle.files,
             name,
             canister,
@@ -202,7 +218,7 @@ pub async fn deploy(
     // one that calls a canister the step listed would otherwise reach a
     // canister with no module in it.
     for (name, (canister_dir, canister)) in &env.canisters {
-        let canister_id = match id_of(&ids, is_cache, environment, name) {
+        let canister_id = match id_of(&canister_ids, name) {
             Ok(canister_id) => canister_id,
             Err(message) => return run.fail(emitter, name, message),
         };
@@ -216,32 +232,50 @@ pub async fn deploy(
                 message: "Running the sync steps the manifest declares…".to_owned(),
             });
 
+            // The crate's own syncer, with the browser behind each of its seams:
+            // no scripts, wasms out of the bundle, plugins through jco. Built per
+            // canister so the plugin's output lands under the right name.
             let progress = ProgressSink::new(emitter.clone(), name.clone());
-            let plugins = JsPluginExecutor::new(host, bundle.files.clone(), progress.clone());
-            let ctx = SyncStepContext {
-                canister_path: canister_dir.clone(),
+            let syncer = Syncer::new(
+                Arc::new(NoScripts),
+                Arc::new(BundleWasm(bundle.files.clone())),
+                Arc::new(JsPluginRunner::new(
+                    Arc::clone(host),
+                    bundle.files.clone(),
+                    progress,
+                )),
+            );
+            let params = Params {
+                path: canister_dir.clone(),
                 project_dir: bundle.project.dir.clone(),
-                canister_id,
-                canister_name: canister.name.clone(),
+                cid: canister_id,
+                name: canister.name.clone(),
                 environment: environment.to_owned(),
                 network: env.network.name.clone(),
+                urls: urls.clone(),
                 canister_ids: canister_ids.clone(),
                 // A proxy is something icp-cli is given on the command line;
                 // a browser deployment has none.
                 proxy: None,
             };
 
-            if let Err(e) =
-                run_sync_steps(canister, &ctx, &plugins, &NoScripts, Some(&progress)).await
-            {
-                return run.fail(
-                    emitter,
-                    name,
-                    format!(
-                        "Could not sync canister \"{name}\" ({canister_id}): {}",
-                        chain(&e)
-                    ),
-                );
+            for step in &canister.sync.steps {
+                // A plugin's output is streamed to the emitter as it prints, so
+                // the reporter — which would carry the same lines — is left
+                // unconnected, and the lines a step hands back were seen already.
+                let synced = syncer
+                    .sync(step, &params, &calls, &StepReporter::null())
+                    .await;
+                if let Err(e) = synced {
+                    return run.fail(
+                        emitter,
+                        name,
+                        format!(
+                            "Could not sync canister \"{name}\" ({canister_id}): {}",
+                            flatten(&e)
+                        ),
+                    );
+                }
             }
         }
 
@@ -254,16 +288,13 @@ pub async fn deploy(
     // ── Hand over control, if the bundle asked for it ─────────────────────
     // The deployer stays a controller alongside whoever the manifest names: a
     // list sent verbatim would replace it, not extend it.
-    let mapping = ids
-        .lookup_by_environment(is_cache, environment)
-        .unwrap_or_default();
     for (name, (_, canister)) in &env.canisters {
-        let canister_id = match id_of(&ids, is_cache, environment, name) {
+        let canister_id = match id_of(&canister_ids, name) {
             Ok(canister_id) => canister_id,
             Err(message) => return run.handover_failed(emitter, name, message),
         };
 
-        let handover = match settings::controllers(canister, &mapping, host.caller()) {
+        let handover = match settings::controllers(canister, &canister_ids, host.caller()) {
             Ok(None) => continue,
             Ok(Some(handover)) => handover,
             Err(message) => {
@@ -278,7 +309,7 @@ pub async fn deploy(
             }
         };
 
-        if let Err(message) = update_settings(host, canister_id, handover).await {
+        if let Err(message) = update_settings(calls.as_ref(), canister_id, handover).await {
             return run.handover_failed(
                 emitter,
                 name,
@@ -352,69 +383,103 @@ impl Run {
     }
 }
 
-/// The install half of the crate's `deploy_canister`, without the sync half it
-/// runs straight afterwards: the environment variables the canister is given,
-/// the wasm, and a start. `install_code` preserves a canister's status, and a
-/// freshly created one is stopped, so the start is what leaves it able to answer
-/// — both for its own sync steps and for another canister's plugin calling it.
+/// The install half of the crate's deploy, without the sync it runs afterwards:
+/// the environment variables the canister is given, the wasm, and a start.
+/// `install_code` preserves a canister's status, so the start is what makes
+/// sure it can answer — both for its own sync steps and for another canister's
+/// plugin calling it. It is idempotent, so a canister already running loses
+/// nothing to it; icp-cli starts every canister it is about to sync for the
+/// same reason.
 #[allow(clippy::too_many_arguments)]
 async fn install(
-    host: &Host,
+    calls: &dyn CanisterCalls,
     files: &BundleFiles,
     name: &str,
     canister: &Canister,
     canister_id: Principal,
     artifact: &Path,
     init_args: Option<&[u8]>,
-    canister_ids: &BTreeMap<String, Principal>,
+    canister_ids: &IdMapping,
 ) -> Result<(), String> {
-    apply_binding_env_vars(canister, canister_id, canister_ids, host)
+    // Each canister is told the ids it is wired to — its own project's
+    // canisters under their local names, its dependencies under their aliases —
+    // resolved against the ids this run created. The same wiring `icp deploy`
+    // writes, from the same table.
+    let bindings: Vec<(String, String)> = canister
+        .bindings
+        .iter()
+        .filter_map(|(variable, key)| {
+            canister_ids
+                .get(key)
+                .map(|id| (format!("PUBLIC_CANISTER_ID:{variable}"), id.to_text()))
+        })
+        .collect();
+    set_env_vars_for_canister(calls, &canister_id, canister, &bindings)
         .await
-        .map_err(|e| chain(&e))?;
+        .map_err(|e| flatten(&e))?;
+
+    // The bundle was checked at load time, so the module is there.
+    let wasm = files
+        .get(artifact)
+        .ok_or_else(|| format!("the module '{artifact}' is not in the bundle"))?;
     install_canister(
+        calls,
+        &canister_id,
         name,
-        canister_id,
-        artifact,
-        InstallMode::Install,
+        wasm,
+        CanisterInstallMode::Install,
+        // Only an upgrade or a reinstall looks at the status, to stop a running
+        // canister first; a fresh install leaves the canister as it found it.
+        CanisterStatusType::Running,
         init_args,
         None,
-        files,
-        host,
     )
     .await
-    .map_err(|e| chain(&e))?;
-    start_canister(host, name, canister_id)
+    .map_err(|e| flatten(&e))?;
+
+    proxy_management::start_canister(calls, CanisterIdRecord { canister_id })
         .await
-        .map_err(|e| chain(&e))
+        .map_err(|e| flatten(&e))
 }
 
 async fn update_settings(
-    host: &Host,
+    calls: &dyn CanisterCalls,
     canister_id: Principal,
-    settings: ic_management_canister_types::CanisterSettings,
+    settings: CanisterSettings,
 ) -> Result<(), String> {
-    let arg = settings::update_settings_arg(canister_id, settings)?;
-    // The management canister has no routing of its own, so the call is
-    // addressed to it but routed to the canister it is about.
-    host.update_call(
-        Principal::management_canister(),
-        "update_settings",
-        arg,
-        canister_id,
-        0,
+    proxy_management::update_settings(
+        calls,
+        UpdateSettingsArgs {
+            canister_id,
+            settings,
+            sender_canister_version: None,
+        },
     )
     .await
-    .map(|_| ())
+    .map_err(|e| flatten(&e))
 }
 
-fn id_of(
-    ids: &InMemoryIdStore,
-    is_cache: bool,
-    environment: &str,
-    name: &str,
-) -> Result<Principal, String> {
-    ids.lookup(is_cache, environment, name)
-        .map_err(|e| chain(&e))
+/// Where the network is reached, as a sync plugin is told it. The API endpoint
+/// is the host's — that is where every call actually goes. The gateway is
+/// whatever the host knows, or failing that what the manifest declares for the
+/// environment's network: a connected network names its gateway, while a
+/// managed one is described by how to launch it, which says nothing about where
+/// a running one is.
+fn network_urls(host: &Host, env: &Environment) -> Result<NetworkUrls, String> {
+    let mut urls = host.network()?;
+    if urls.http_gateway_url.is_none()
+        && let Configuration::Connected { connected } = &env.network.configuration
+    {
+        urls.http_gateway_url = connected.http_gateway_url.clone();
+    }
+    Ok(urls)
+}
+
+fn id_of(canister_ids: &IdMapping, name: &str) -> Result<Principal, String> {
+    canister_ids
+        .get(name)
+        .copied()
+        .ok_or_else(|| format!("no canister was created for \"{name}\""))
 }
 
 /// What is about to be installed, and how. A wasm over the ingress limit goes up
@@ -431,5 +496,27 @@ fn installing(bundle: &LoadedBundle, name: &str) -> String {
         format!("Installing {size} through the chunk store…")
     } else {
         format!("Installing {size}…")
+    }
+}
+
+/// The script runner for a host with no shell. A bundle with a script step is
+/// refused at load time, so this is never reached; the syncer takes one all the
+/// same.
+struct NoScripts;
+
+#[derive(Debug, Snafu)]
+#[snafu(display("a browser cannot run a script step"))]
+struct NoScriptsError;
+
+#[async_trait]
+impl ScriptRunner for NoScripts {
+    async fn run_script(
+        &self,
+        _invocation: ScriptInvocation,
+        _reporter: &StepReporter,
+    ) -> Result<Vec<String>, ScriptRunError> {
+        Err(ScriptRunError {
+            source: Box::new(NoScriptsError),
+        })
     }
 }

@@ -1,20 +1,24 @@
 //! The bundle, as a filesystem.
 //!
-//! `icp-deploy-canister` reads a project through [`FileAccess`] rather than
-//! `std::fs`, which is what lets the same loader run here: the archive is
-//! unpacked into memory once and every path the manifest names — the wasms, the
-//! sync plugins, the directories a plugin uploads — is served out of that map.
-//! The bundle root is `/`, so a manifest path resolves exactly as it would on
-//! disk, without any of it ever touching a disk.
+//! `icp-project` reads a project through [`FileSystem`] rather than `std::fs`,
+//! which is what lets the same loader run here: the archive is unpacked into
+//! memory once and every path the manifest names — the wasms, the sync plugins,
+//! the directories a plugin uploads — is served out of that map. The bundle root
+//! is `/`, so a manifest path resolves exactly as it would on disk, without any
+//! of it ever touching a disk.
+//!
+//! The trait also has the writes a build needs. A bundle is never built, only
+//! read, so those refuse rather than pretend.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use camino::Utf8Component;
-use icp_deploy_canister::{
-    files::{FileAccess, FileAccessError},
+use icp_project::{
+    files::{FileSystem, FsError, Scratch},
     prelude::*,
 };
+use snafu::Snafu;
 
 /// The bundle root. Every entry is keyed by its absolute path beneath it.
 pub const ROOT: &str = "/";
@@ -35,6 +39,16 @@ impl BundleFiles {
 
     pub fn contains(&self, path: &Path) -> bool {
         self.0.contains_key(&normalize(path))
+    }
+
+    /// A directory exists exactly when the archive holds a file beneath it —
+    /// tar directory entries carry nothing, so they are not kept. A path that
+    /// names a file is not a directory, whatever the manifest calls it.
+    pub fn is_dir(&self, path: &Path) -> bool {
+        let prefix = normalize(path);
+        self.0
+            .keys()
+            .any(|entry| entry != &prefix && entry.starts_with(&prefix))
     }
 
     /// Every file at or beneath `dir`, in path order, as `(path, contents)`.
@@ -78,44 +92,83 @@ pub fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl FileAccess for BundleFiles {
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
-        self.get(path)
+/// Why the bundle could not serve a request. Wrapped in [`FsError`] at the trait
+/// boundary, which displays it as itself.
+#[derive(Debug, Snafu)]
+pub enum BundleFsError {
+    #[snafu(display("'{path}' is not in the bundle"))]
+    NotInBundle { path: PathBuf },
+
+    #[snafu(display("'{path}' is not valid UTF-8"))]
+    NotText { path: PathBuf },
+
+    #[snafu(display("cannot write '{path}': a bundle is read-only"))]
+    ReadOnly { path: PathBuf },
+
+    #[snafu(display("a bundle has no scratch space: nothing is built out of one"))]
+    NoScratch,
+}
+
+impl From<BundleFsError> for FsError {
+    fn from(error: BundleFsError) -> Self {
+        FsError::new(error)
+    }
+}
+
+#[async_trait]
+impl FileSystem for BundleFiles {
+    async fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+        Ok(self
+            .get(path)
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| FileAccessError::Read {
+            .ok_or_else(|| BundleFsError::NotInBundle {
                 path: path.to_owned(),
-                message: "not in the bundle".to_owned(),
-            })
+            })?)
     }
 
-    async fn read_to_string(&self, path: &Path) -> Result<String, FileAccessError> {
-        let bytes = self.read_file(path).await?;
-        String::from_utf8(bytes).map_err(|_| FileAccessError::Read {
+    async fn read_to_string(&self, path: &Path) -> Result<String, FsError> {
+        let bytes = self.read(path).await?;
+        Ok(
+            String::from_utf8(bytes).map_err(|_| BundleFsError::NotText {
+                path: path.to_owned(),
+            })?,
+        )
+    }
+
+    async fn write(&self, path: &Path, _contents: &[u8]) -> Result<(), FsError> {
+        Err(BundleFsError::ReadOnly {
             path: path.to_owned(),
-            message: "not valid UTF-8".to_owned(),
-        })
+        }
+        .into())
+    }
+
+    async fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        Err(BundleFsError::ReadOnly {
+            path: path.to_owned(),
+        }
+        .into())
+    }
+
+    async fn copy(&self, _from: &Path, to: &Path) -> Result<(), FsError> {
+        Err(BundleFsError::ReadOnly {
+            path: to.to_owned(),
+        }
+        .into())
     }
 
     async fn exists(&self, path: &Path) -> bool {
-        self.is_file(path).await || self.is_dir(path).await
+        self.contains(path) || BundleFiles::is_dir(self, path)
     }
 
     async fn is_file(&self, path: &Path) -> bool {
         self.contains(path)
     }
 
-    /// A directory exists exactly when the archive holds a file beneath it —
-    /// tar directory entries carry nothing, so they are not kept.
     async fn is_dir(&self, path: &Path) -> bool {
-        let prefix = normalize(path);
-        self.0
-            .keys()
-            .any(|entry| entry != &prefix && entry.starts_with(&prefix))
+        BundleFiles::is_dir(self, path)
     }
 
-    async fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, FileAccessError> {
+    async fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, FsError> {
         let prefix = normalize(path);
         let mut children: Vec<PathBuf> = self
             .0
@@ -132,7 +185,11 @@ impl FileAccess for BundleFiles {
     /// so identity is just the normalized path.
     async fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         let path = normalize(path);
-        (self.contains(&path) || self.is_dir(&path).await || path == ROOT).then_some(path)
+        (self.contains(&path) || BundleFiles::is_dir(self, &path) || path == ROOT).then_some(path)
+    }
+
+    async fn scratch_dir(&self) -> Result<Box<dyn Scratch>, FsError> {
+        Err(BundleFsError::NoScratch.into())
     }
 }
 

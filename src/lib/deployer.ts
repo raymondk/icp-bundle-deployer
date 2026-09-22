@@ -29,6 +29,14 @@ export interface DeployerOptions {
    * anywhere else.
    */
   environment?: string
+  /**
+   * Where the network serves canisters over HTTP. Sync plugins are told it, so
+   * one can say where the site it uploaded is reachable. Omitted, the manifest's
+   * own declaration for the network is used when it has one — the default `ic`
+   * network names mainnet's gateway — and a plugin is otherwise told there is
+   * none.
+   */
+  gatewayUrl?: string
 }
 
 export interface DeployOptions {
@@ -55,6 +63,7 @@ export function createDeployer({
   agent,
   cycles = DEFAULT_CREATION_CYCLES,
   environment,
+  gatewayUrl,
 }: DeployerOptions): Deployer {
   return {
     load: (source) => loadBundle(source),
@@ -73,6 +82,7 @@ export function createDeployer({
           identityPrincipal,
           cycles,
           subnet: subnet === undefined ? undefined : toPrincipal(subnet),
+          gatewayUrl,
           onEvent,
         })
 

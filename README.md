@@ -109,8 +109,8 @@ Those are phases, not a per-canister loop, and the order matters: every canister
 before any wasm is installed, and every wasm is installed before any sync runs. The second
 separation is there because a sync plugin may call the canisters its step lists, and one
 that ran between installs would be calling a canister with nothing in it yet.
-`icp-deploy-canister` installs and syncs a canister together, so this is the one place the
-deployer drives its pieces rather than its whole. If a phase fails the run stops and the
+`icp-project`'s own deploy installs and syncs a canister together, so this is the one place
+the deployer drives its pieces rather than its whole. If a phase fails the run stops and the
 page reports which canisters exist but are unfinished, so nothing is silently abandoned —
 they exist and you control them.
 
@@ -199,7 +199,12 @@ are unaffected.
 A `dirs:`/`files:` entry is written relative to the canister's own directory but resolved
 inside the whole project, so it may rise out of that directory with `..` and name anything
 else the bundle carries. What it may not do is leave the bundle: nothing outside one exists
-to hand the plugin, and such an entry is refused at load time.
+to hand the plugin, and such an entry is refused at load time. How the entries are written
+depends on the interface the plugin was built against, and a mismatch is refused at load
+time too, as icp-cli refuses it when it loads the plugin: an `icp:sync-plugin@0.1` plugin
+takes `dirs:` and `files:` as plain lists, while an `@0.2` plugin takes everything under
+`files:` as a map of name → path, and a directory is told from a file by what the bundle
+carries.
 
 There is no proxy canister in a browser — that is something the CLI is given on the command
 line — so every request a plugin makes takes the direct route, and the `direct` flag each

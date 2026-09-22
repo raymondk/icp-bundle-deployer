@@ -23,6 +23,12 @@ export interface HostOptions {
   cycles?: bigint
   /** Pin every canister to this subnet. */
   subnet?: Principal
+  /**
+   * Where the network serves canisters over HTTP, as sync plugins are told it.
+   * Omitted, the module falls back to what the bundle's manifest declares for
+   * the network, if anything.
+   */
+  gatewayUrl?: string
   onEvent: (event: DeployEvent) => void
 }
 
@@ -31,6 +37,7 @@ export function createHost({
   identityPrincipal,
   cycles,
   subnet,
+  gatewayUrl,
   onEvent,
 }: HostOptions): DeployerHost {
   const placement = createPlacement({ agent, cycles, subnet, onEvent })
@@ -63,5 +70,11 @@ export function createHost({
     },
 
     runPlugin,
+
+    network() {
+      // The agent's host is where every call this deployment makes is sent, so
+      // it is the API endpoint whatever the manifest may say about the network.
+      return { apiUrl: agent.host.href, gatewayUrl }
+    },
   }
 }
