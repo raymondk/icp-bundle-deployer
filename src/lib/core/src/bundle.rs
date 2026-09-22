@@ -1,31 +1,33 @@
 //! Turning an archive into a project this deployer is willing to deploy.
 //!
-//! The manifest is parsed by `icp-deploy-canister` — the same loader icp-cli
-//! runs — so a bundle is understood exactly as the CLI understands it, down to
-//! the unit suffixes on settings and the shape of init args. What is added here
-//! is the part that only matters for a bundle: everything the manifest names has
-//! to be *inside* the archive, and has to hash to what the manifest says it does.
+//! The manifest is parsed by `icp-project` — the same loader icp-cli runs — so a
+//! bundle is understood exactly as the CLI understands it, down to the unit
+//! suffixes on settings and the shape of init args. What is added here is the
+//! part that only matters for a bundle: everything the manifest names has to be
+//! *inside* the archive, and has to hash to what the manifest says it does.
 //!
 //! All of it happens before a deployment starts. A bundle that cannot be
 //! deployed is refused while it is still bytes in a tab, not after some of its
 //! canisters already exist on chain.
 
-use icp_deploy_canister::{
-    Canister, Project, bundle_get_canister_module_path,
-    canister::recipe::NoResolve,
+use icp_project::{
+    Canister, Project,
+    error::flatten,
     manifest::{
-        BuildStep, PROJECT_MANIFEST, ProjectManifest, SyncStep, load_manifest, plugin::NamedPaths,
+        BuildStep, PROJECT_MANIFEST, ProjectManifest, SyncStep, load_manifest_from_path,
+        plugin::{NamedPath, NamedPaths},
         prebuilt::SourceField,
     },
     prelude::*,
-    project::{consolidate_manifest, verify_sandbox},
+    project::consolidate_manifest,
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
-    abi::plugin_abi,
+    abi::{PluginAbi, plugin_abi},
     archive::read_archive,
     files::{BundleFiles, ROOT, normalize},
+    recipe::LocalRecipes,
     sandbox::{Escape, covering_dirs},
 };
 
@@ -92,7 +94,7 @@ pub struct LoadedBundle {
 
 /// Read, validate, and verify a bundle.
 pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
-    let files = read_archive(data).map_err(|e| BundleError::archive(chain(&e)))?;
+    let files = read_archive(data).map_err(|e| BundleError::archive(flatten(&e)))?;
     let root = Path::new(ROOT);
     let manifest_path = root.join(PROJECT_MANIFEST);
 
@@ -104,15 +106,15 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
 
     // Read the manifest before consolidating it, to refuse what a bundle may not
     // declare with a message about the bundle rather than about a missing file.
-    let manifest: ProjectManifest = load_manifest(&files, &manifest_path)
+    let manifest: ProjectManifest = load_manifest_from_path(&files, &manifest_path)
         .await
-        .map_err(|e| BundleError::manifest(chain(&e)))?;
+        .map_err(|e| BundleError::manifest(flatten(&e)))?;
 
     // Nothing in a bundle is fetched: recipes and plugin wasms must already be
     // in the archive, so the resolver only ever serves what is.
-    let project = consolidate_manifest(&files, root, &NoResolve(files.clone()), &manifest)
+    let project = consolidate_manifest(&files, root, &LocalRecipes(files.clone()), &manifest)
         .await
-        .map_err(|e| BundleError::manifest(chain(&e)))?;
+        .map_err(|e| BundleError::manifest(flatten(&e)))?;
 
     // Asked of the workspace rather than of the root manifest: an umbrella
     // project declares no canisters of its own and exists to pull together the
@@ -123,10 +125,7 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
         ));
     }
 
-    // Script steps shell out, which a browser cannot do. This is the crate's own
-    // sandbox rule, so a bundle refused here would be refused by any sandboxed
-    // host.
-    verify_sandbox(&project).map_err(|e| BundleError::manifest(chain(&e)))?;
+    verify_sandbox(&project)?;
 
     let mut canisters = Vec::new();
     for (name, (canister_dir, canister)) in &project.canisters {
@@ -153,13 +152,70 @@ pub async fn load_bundle(data: &[u8]) -> Result<LoadedBundle, BundleError> {
     })
 }
 
+/// Refuse a project with a script step in it. Scripts shell out, which a
+/// browser cannot do, and everything a bundle installs or syncs is a wasm it
+/// carries — pre-built modules and sync plugins — so a script has no place in
+/// one. Checked on the consolidated project, after recipes have rendered into
+/// concrete steps, so a recipe that expands to a script is caught too.
+fn verify_sandbox(project: &Project) -> Result<(), BundleError> {
+    for (name, (_, canister)) in &project.canisters {
+        let build = canister
+            .build
+            .steps
+            .iter()
+            .any(|step| matches!(step, BuildStep::Script(_)));
+        let sync = canister
+            .sync
+            .steps
+            .iter()
+            .any(|step| matches!(step, SyncStep::Script(_)));
+        let phase = match (build, sync) {
+            (true, _) => "built",
+            (false, true) => "synced",
+            (false, false) => continue,
+        };
+        return Err(BundleError::manifest(format!(
+            "Canister \"{name}\" is {phase} by a script step, which runs a command on the machine \
+             deploying it. A bundle carries pre-built wasms and sync plugins, and nothing in it \
+             can run a script."
+        )));
+    }
+    Ok(())
+}
+
+/// The local wasm module a bundled canister is built from. A bundle's canisters
+/// are each built by a single `pre-built` step naming a module in the archive;
+/// anything else is not a shape a bundle can carry.
+fn module_path(canister: &Canister) -> Result<&Path, String> {
+    let name = &canister.name;
+    let steps = &canister.build.steps;
+    let [step] = steps.as_slice() else {
+        return Err(format!(
+            "Canister \"{name}\" does not have a single build step (found {}); a bundled canister \
+             must be built by exactly one pre-built step",
+            steps.len()
+        ));
+    };
+    let BuildStep::Prebuilt(adapter) = step else {
+        return Err(format!(
+            "Canister \"{name}\" is not built by a pre-built step; a bundled canister's module must \
+             come from one"
+        ));
+    };
+    match &adapter.source {
+        SourceField::Local(local) => Ok(&local.path),
+        SourceField::Remote(_) => Err(format!(
+            "Canister \"{name}\" is built from a remote URL, not a module in the bundle"
+        )),
+    }
+}
+
 /// The artifact a canister installs: the single pre-built local module its build
 /// step names, resolved against the canister's own directory.
 pub fn artifact_path(canister_dir: &Path, canister: &Canister) -> Result<PathBuf, BundleError> {
-    let module = bundle_get_canister_module_path(canister).map_err(|e| {
+    let module = module_path(canister).map_err(|message| {
         BundleError::manifest(format!(
-            "{}. A bundle must carry every wasm it installs.",
-            chain(&e)
+            "{message}. A bundle must carry every wasm it installs."
         ))
     })?;
     Ok(normalize(&canister_dir.join(module)))
@@ -219,10 +275,10 @@ async fn check_canister(
         // Which interface it speaks decides how it is called at all, so a plugin
         // this deployer could not drive is refused now rather than after the
         // canister it syncs is already installed.
-        plugin_abi(plugin).map_err(|e| {
+        let abi = plugin_abi(plugin).map_err(|e| {
             BundleError::manifest(format!(
                 "The sync plugin of canister \"{name}\" cannot be run: {}.",
-                chain(&e)
+                flatten(&e)
             ))
         })?;
 
@@ -238,29 +294,33 @@ async fn check_canister(
             }
         }
 
-        let declared: Vec<&str> = adapter
-            .dirs
-            .iter()
-            .flat_map(NamedPaths::entries)
-            .map(|entry| entry.path)
-            .collect();
-        for dir in &declared {
-            let path = resolve_declared(&base, dir, name, "declares", "for syncing")?;
-            if files.under(&path).is_empty() {
+        let dirs: Vec<NamedPath<'_>> = adapter.dirs.iter().flat_map(NamedPaths::entries).collect();
+        let entries: Vec<NamedPath<'_>> =
+            adapter.files.iter().flat_map(NamedPaths::entries).collect();
+        check_declared_forms(abi, name, &dirs, &entries)?;
+
+        // A `dirs:` entry is a directory by declaration. A `files:` entry is
+        // whichever the bundle says, for a plugin whose interface takes both
+        // there; the older interface has no way to be handed a directory under
+        // `files:`, so for it every entry there is a file to read.
+        let mut declared_dirs: Vec<&str> = Vec::new();
+        for entry in &dirs {
+            let path = resolve_declared(&base, entry.path, name, "declares", "for syncing")?;
+            if !files.is_dir(&path) {
                 return Err(BundleError::manifest(format!(
-                    "Canister \"{name}\" declares \"{dir}\" for syncing, but the bundle contains \
-                     no files under that path."
+                    "Canister \"{name}\" declares \"{}\" for syncing, but the bundle contains no \
+                     files under that path.",
+                    entry.path
                 )));
             }
+            declared_dirs.push(entry.path);
         }
-        // The declared list is configuration — the same tree may be named twice,
-        // or beside a subtree of itself — but what gets uploaded is the trees
-        // behind it, which is what is worth reporting.
-        sync_dirs.extend(covering_dirs(declared).into_iter().map(str::to_owned));
-
-        for entry in adapter.files.iter().flat_map(NamedPaths::entries) {
-            let file = entry.path;
-            let path = resolve_declared(&base, file, name, "passes", "to its sync plugin")?;
+        for entry in &entries {
+            let path = resolve_declared(&base, entry.path, name, "passes", "to its sync plugin")?;
+            if abi == PluginAbi::V2 && files.is_dir(&path) {
+                declared_dirs.push(entry.path);
+                continue;
+            }
             let contents = read(
                 files,
                 &path,
@@ -270,11 +330,16 @@ async fn check_canister(
             // text cannot be passed to it at all.
             if str::from_utf8(contents).is_err() {
                 return Err(BundleError::manifest(format!(
-                    "Canister \"{name}\" passes \"{file}\" to its sync plugin, which takes text, \
-                     but that file is not valid UTF-8."
+                    "Canister \"{name}\" passes \"{}\" to its sync plugin, which takes text, but \
+                     that file is not valid UTF-8.",
+                    entry.path
                 )));
             }
         }
+        // The declared list is configuration — the same tree may be named twice,
+        // or beside a subtree of itself — but what gets uploaded is the trees
+        // behind it, which is what is worth reporting.
+        sync_dirs.extend(covering_dirs(declared_dirs).into_iter().map(str::to_owned));
     }
 
     Ok(CanisterSummary {
@@ -285,6 +350,58 @@ async fn check_canister(
         digest,
         sync_dirs,
     })
+}
+
+/// Refuse paths declared in a form the plugin's interface cannot carry — the
+/// rule icp-cli's runtime applies when it loads a plugin, brought forward to
+/// before anything is deployed.
+///
+/// The two interfaces disagree on both counts. `icp:sync-plugin@0.1` has a bare
+/// path in each list and nowhere to put a key, so its entries must be plain
+/// lists; `@0.2` names every entry and has no `dirs:` of its own, so its entries
+/// must be a map under `files:` alone. Refusing the mismatch is what keeps it
+/// from surfacing as a silently dropped key or a directory the plugin was never
+/// told about.
+fn check_declared_forms(
+    abi: PluginAbi,
+    name: &str,
+    dirs: &[NamedPath<'_>],
+    files: &[NamedPath<'_>],
+) -> Result<(), BundleError> {
+    match abi {
+        PluginAbi::V1 => {
+            if let Some(entry) = dirs.iter().chain(files).find(|entry| entry.key.is_some()) {
+                return Err(BundleError::manifest(format!(
+                    "Canister \"{name}\" declares \"{}\" under the name \"{}\", but its sync plugin \
+                     implements icp:sync-plugin@0.1, whose entries carry no name. Write \
+                     `dirs:`/`files:` as plain lists of paths, or rebuild the plugin against \
+                     icp:sync-plugin@0.2.",
+                    entry.path,
+                    entry.key.unwrap_or_default()
+                )));
+            }
+        }
+        PluginAbi::V2 => {
+            if let Some(entry) = dirs.first() {
+                return Err(BundleError::manifest(format!(
+                    "Canister \"{name}\" declares \"{}\" under `dirs:`, but its sync plugin \
+                     implements icp:sync-plugin@0.2, which has no separate `dirs:` setting. List \
+                     the directory under `files:` instead; a directory is told from a file by what \
+                     the bundle carries.",
+                    entry.path
+                )));
+            }
+            if let Some(entry) = files.iter().find(|entry| entry.key.is_none()) {
+                return Err(BundleError::manifest(format!(
+                    "Canister \"{name}\" declares \"{}\" in a plain list, but its sync plugin \
+                     implements icp:sync-plugin@0.2, which names every entry. Write `files:` as a \
+                     map of name → path, or rebuild the plugin against icp:sync-plugin@0.1.",
+                    entry.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `target`, as the sync step of the canister keyed `syncing` spelled
@@ -381,7 +498,7 @@ fn check_init_args(
             ),
             None => format!("The init args of canister \"{name}\""),
         };
-        BundleError::manifest(format!("{subject} could not be encoded: {}", chain(&e)))
+        BundleError::manifest(format!("{subject} could not be encoded: {}", flatten(&e)))
     })
 }
 
@@ -427,20 +544,6 @@ fn check_digest(
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
-}
-
-/// A snafu error and everything under it, as one line. The crate's errors put
-/// the context in the outer message and the cause in the source, so only the
-/// whole chain says what actually went wrong.
-pub fn chain(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(current) = source {
-        message.push_str(": ");
-        message.push_str(&current.to_string());
-        source = current.source();
-    }
-    message
 }
 
 #[cfg(test)]

@@ -651,30 +651,95 @@ fn rejects_a_sync_directory_outside_the_bundle() {
     );
 }
 
-/// `dirs`/`files` may be written as a map, which tags each entry with a name the
-/// plugin looks it up by. The paths are the same paths either way.
+/// A plugin built against `icp:sync-plugin@0.2` takes everything under `files:`,
+/// written as a map that tags each entry with a name the plugin looks it up by.
+/// Which entries are directories is told from what the bundle carries, and the
+/// paths are the same paths either way.
 #[test]
-fn accepts_dirs_and_files_written_as_a_map() {
+fn accepts_files_written_as_a_map_for_a_v2_plugin() {
+    let wasm = plugin("0.2.0");
     let step = formatdoc! {"
         - type: plugin
           path: plugins/sync.wasm
           sha256: {}
-          dirs:
+          files:
             site: assets
             extra:
             - assets/nested
-          files:
             config: assets/config.txt
-    ", digest(&plugin_wasm())};
+    ", digest(&wasm)};
 
     let extra = vec![
         file("assets/index.html", "<h1>hi"),
         file("assets/nested/page.html", "<h1>nested"),
         file("assets/config.txt", "key = value"),
     ];
-    let loaded = load(&with_plugin(&step, extra)).expect("a keyed step should be accepted");
-    // `assets/nested` is inside `assets`, so it is one tree to upload, not two.
+    let loaded =
+        load(&with_plugin_wasm(&step, wasm, extra)).expect("a keyed step should be accepted");
+    // `assets/nested` is inside `assets`, so it is one tree to upload, not two;
+    // `assets/config.txt` is a file, passed inline rather than mounted.
     assert_eq!(loaded.canisters[0].sync_dirs, ["assets"]);
+}
+
+// The two interface versions disagree on how declared paths are written, and a
+// mismatch is refused up front — the rule icp-cli's runtime applies when it
+// loads a plugin — rather than surfacing as a silently dropped key or a
+// directory the plugin was never told about.
+
+/// `icp:sync-plugin@0.1` has nowhere to put a key, so its entries must be plain
+/// lists.
+#[test]
+fn rejects_a_named_entry_for_a_v1_plugin() {
+    let step = formatdoc! {"
+        - type: plugin
+          path: plugins/sync.wasm
+          sha256: {}
+          dirs:
+            site: assets
+    ", digest(&plugin_wasm())};
+    refuses(
+        &with_plugin(&step, assets()),
+        BundleErrorKind::Manifest,
+        "carry no name",
+    );
+}
+
+/// `icp:sync-plugin@0.2` has no `dirs:` of its own: a directory goes under
+/// `files:`, and the bundle says which entries there are directories.
+#[test]
+fn rejects_a_dirs_setting_for_a_v2_plugin() {
+    let wasm = plugin("0.2.0");
+    let step = formatdoc! {"
+        - type: plugin
+          path: plugins/sync.wasm
+          sha256: {}
+          dirs:
+            site: assets
+    ", digest(&wasm)};
+    refuses(
+        &with_plugin_wasm(&step, wasm, assets()),
+        BundleErrorKind::Manifest,
+        "no separate `dirs:`",
+    );
+}
+
+/// `icp:sync-plugin@0.2` names every entry, so a plain list has nothing to name
+/// them with.
+#[test]
+fn rejects_an_unnamed_entry_for_a_v2_plugin() {
+    let wasm = plugin("0.2.0");
+    let step = formatdoc! {"
+        - type: plugin
+          path: plugins/sync.wasm
+          sha256: {}
+          files:
+          - assets
+    ", digest(&wasm)};
+    refuses(
+        &with_plugin_wasm(&step, wasm, assets()),
+        BundleErrorKind::Manifest,
+        "names every entry",
+    );
 }
 
 /// A step may only reach canisters the bundle actually declares. An environment

@@ -42,13 +42,15 @@ interface SyncExecInputV1 extends CommonExecInput {
 }
 
 /**
- * The v0.2.0 shape: every declared path keeps the key it was written under, and
- * the plugin is additionally handed the step's fields and the names of every
- * canister the deployment created.
+ * The v0.2.0 shape: every declared path carries the key it was written under,
+ * and the plugin is additionally told where the network is, handed the step's
+ * fields, and given the names of every canister the deployment created.
  */
 interface SyncExecInputV2 extends CommonExecInput {
-  dirs: { key?: string; path: string }[]
-  files: { key?: string; name: string; content: string }[]
+  apiUrl: string
+  gatewayUrl?: string
+  dirs: { key: string; path: string }[]
+  files: { key: string; name: string; content: string }[]
   fields: { name: string; value: string }[]
   canisterIds: { name: string; id: string }[]
 }
@@ -134,11 +136,29 @@ function execInput(
 
   return {
     ...common,
-    dirs: request.dirs,
-    files: request.files,
+    apiUrl: request.network.apiUrl,
+    gatewayUrl: request.network.gatewayUrl,
+    dirs: request.dirs.map(({ key, path }) => ({ key: named(key, path), path })),
+    files: request.files.map(({ key, name, content }) => ({
+      key: named(key, name),
+      name,
+      content,
+    })),
     fields: request.fields,
     canisterIds: request.canisterIds,
   }
+}
+
+/**
+ * The key a v0.2.0 entry was declared under. The interface names every entry,
+ * and the module refuses a bundle whose entries for such a plugin carry none,
+ * so a missing key here is a bug rather than a manifest to explain.
+ */
+function named(key: string | undefined, path: string): string {
+  if (key === undefined) {
+    throw new SyncError(`The sync step's entry "${path}" reached the plugin without a name.`)
+  }
+  return key
 }
 
 /**

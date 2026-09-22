@@ -1,37 +1,45 @@
 //! Running a bundle's sync plugin.
 //!
 //! A sync plugin is a `wasm32-wasip2` component, which this module cannot run
-//! and does not try to: `icp-deploy-canister` resolves the step into a
-//! [`PluginInvocation`] — which wasm, which directories, which canister — and
-//! the host runs it through jco. What is done here is the resolution the CLI's
-//! host also does: find the wasm, check it against its digest, and lay out the
-//! files the plugin is allowed to see.
+//! and does not try to: `icp-project` resolves the step into an [`Invocation`]
+//! — which wasm, which declared paths, which canister — and the host runs it
+//! through jco. What is done here is what icp-cli's own runtime does around the
+//! component: find the wasm, tell a declared directory from a declared file, and
+//! lay out what the plugin is allowed to see.
 //!
 //! The plugin is the same wasm `icp sync` runs, so what lands on the canister —
 //! compression, clean URLs, redirect rules, the resulting state hash — matches a
 //! CLI deployment rather than approximating it.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use icp_deploy_canister::{
+use icp_events::StepReporter;
+use icp_project::{
+    canister::{
+        sync::plugin::{Invocation, KeyedPath, Run, RunError},
+        wasm::{Fetch, FetchError},
+    },
     manifest::prebuilt::SourceField,
     prelude::*,
-    sync_exec::{PluginExecutor, PluginExecutorError, PluginInvocation, StepProgress},
 };
 use js_sys::{Array, Function, Map, Object, Reflect, Uint8Array};
 use snafu::Snafu;
+use url::Url;
 use wasm_bindgen::prelude::*;
 
 use crate::{
-    abi::plugin_abi,
+    abi::{PluginAbi, plugin_abi},
     bundle::sha256_hex,
     events::ProgressSink,
     files::{BundleFiles, normalize},
-    host::Host,
+    host::{Host, assume_send},
     sandbox::{covering_dirs, resolve},
 };
 
+/// Why a plugin wasm could not be produced.
 #[derive(Debug, Snafu)]
-pub enum PluginError {
+pub enum WasmError {
     #[snafu(display(
         "the plugin is referenced by URL, and a bundle must carry every plugin it runs"
     ))]
@@ -49,6 +57,50 @@ pub enum PluginError {
         expected: String,
         actual: String,
     },
+}
+
+/// Serves the plugin wasms the bundle carries, and nothing that would have to
+/// be fetched. `icp-project` asks for a path rather than bytes, since icp-cli's
+/// runtime loads the component off disk; here the path is the key the bytes are
+/// read back by.
+pub struct BundleWasm(pub BundleFiles);
+
+#[async_trait]
+impl Fetch for BundleWasm {
+    async fn wasm(
+        &self,
+        source: &SourceField,
+        base_dir: &Path,
+        sha256: Option<&str>,
+        _reporter: &StepReporter,
+    ) -> Result<PathBuf, FetchError> {
+        let SourceField::Local(source) = source else {
+            return Err(FetchError::new(WasmError::Remote));
+        };
+        let path = normalize(&base_dir.join(&source.path));
+        let wasm = self
+            .0
+            .get(&path)
+            .ok_or_else(|| FetchError::new(WasmError::Missing { path: path.clone() }))?;
+
+        if let Some(expected) = sha256 {
+            let actual = sha256_hex(wasm);
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err(FetchError::new(WasmError::Digest {
+                    path,
+                    expected: expected.to_owned(),
+                    actual,
+                }));
+            }
+        }
+        Ok(path)
+    }
+}
+
+#[derive(Debug, Snafu)]
+pub enum PluginError {
+    #[snafu(display("the plugin wasm '{path}' is not in the bundle"))]
+    MissingWasm { path: PathBuf },
 
     #[snafu(display("the file '{path}' the step passes to the plugin is not in the bundle"))]
     MissingFile { path: PathBuf },
@@ -70,14 +122,14 @@ pub enum PluginError {
 }
 
 /// Runs sync plugins through the host's jco adapter.
-pub struct JsPluginExecutor<'a> {
-    host: &'a Host,
+pub struct JsPluginRunner {
+    host: Arc<Host>,
     files: BundleFiles,
     progress: ProgressSink,
 }
 
-impl<'a> JsPluginExecutor<'a> {
-    pub fn new(host: &'a Host, files: BundleFiles, progress: ProgressSink) -> Self {
+impl JsPluginRunner {
+    pub fn new(host: Arc<Host>, files: BundleFiles, progress: ProgressSink) -> Self {
         Self {
             host,
             files,
@@ -86,74 +138,72 @@ impl<'a> JsPluginExecutor<'a> {
     }
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl PluginExecutor for JsPluginExecutor<'_> {
-    async fn run_plugin(
-        &self,
-        invocation: PluginInvocation,
-        _progress: Option<&dyn StepProgress>,
-    ) -> Result<Vec<String>, PluginExecutorError> {
-        self.run(invocation)
+#[async_trait]
+impl Run for JsPluginRunner {
+    async fn run(&self, invocation: Invocation) -> Result<Vec<String>, RunError> {
+        assume_send(self.run_js(invocation))
             .await
-            .map_err(|source| PluginExecutorError {
-                source: Box::new(source),
-            })?;
+            .map_err(RunError::new)?;
         // Output is streamed as it is printed rather than retained, so there is
         // nothing left to hand back.
         Ok(Vec::new())
     }
 }
 
-impl JsPluginExecutor<'_> {
-    async fn run(&self, invocation: PluginInvocation) -> Result<(), PluginError> {
+impl JsPluginRunner {
+    async fn run_js(&self, invocation: Invocation) -> Result<(), PluginError> {
         // Declared paths are written relative to the canister's own directory
         // and resolved inside the project. A bundle's project directory is the
         // archive root — `invocation.project_dir` is always it — so confining to
         // the root, which is all `resolve` can do, is the rule icp-cli applies.
         let base = normalize(&invocation.base_dir);
 
-        let SourceField::Local(source) = &invocation.source else {
-            return Err(PluginError::Remote);
-        };
-        let path = normalize(&base.join(&source.path));
-        let wasm = self
-            .files
-            .get(&path)
-            .ok_or_else(|| PluginError::Missing { path: path.clone() })?;
-
-        if let Some(expected) = &invocation.sha256 {
-            let actual = sha256_hex(wasm);
-            if !expected.eq_ignore_ascii_case(&actual) {
-                return Err(PluginError::Digest {
-                    path,
-                    expected: expected.clone(),
-                    actual,
-                });
-            }
-        }
+        // The path the fetch seam handed back is the key the wasm is read by.
+        let wasm =
+            self.files
+                .get(&invocation.wasm_path)
+                .ok_or_else(|| PluginError::MissingWasm {
+                    path: invocation.wasm_path.clone(),
+                })?;
 
         // Which interface the plugin speaks decides the shape of everything
         // below it, so it is settled before any of that is assembled. The bundle
-        // was refused at load time for one this deployer cannot drive.
+        // was refused at load time for one this deployer cannot drive, and for
+        // paths declared in a form the interface cannot carry.
         let abi = plugin_abi(wasm).map_err(|source| PluginError::Abi { source })?;
+
+        // A `dirs:` entry is a directory by declaration. A `files:` entry is
+        // whichever the bundle says, for a plugin whose interface takes both
+        // under `files:`; the older interface has no way to be handed a
+        // directory there, so for it every entry is a file to read.
+        let mut dirs: Vec<&KeyedPath> = invocation.dirs.iter().collect();
+        let mut inline: Vec<&KeyedPath> = Vec::new();
+        for entry in &invocation.files {
+            let path = resolve(&base, &entry.path).map_err(|_| PluginError::Outside {
+                declared: entry.path.clone(),
+            })?;
+            if abi == PluginAbi::V2 && self.files.is_dir(&path) {
+                dirs.push(entry);
+            } else {
+                inline.push(entry);
+            }
+        }
 
         // The plugin is told about every declared directory, key and all, but
         // only the trees not already covered by another entry are mounted:
         // naming a directory twice, or naming one inside another's, conveys no
         // further access. Each mount is placed at the spelling the manifest
         // wrote, which is the path the plugin will open it at.
-        let dirs = Array::new();
-        for entry in &invocation.dirs {
+        let dir_inputs = Array::new();
+        for entry in &dirs {
             let dir = Object::new();
             set(&dir, "key", &optional(entry.key.as_deref()));
             set(&dir, "path", &JsValue::from_str(&entry.path));
-            dirs.push(&dir);
+            dir_inputs.push(&dir);
         }
 
         let mounts = Map::new();
-        let declared = invocation.dirs.iter().map(|entry| entry.path.as_str());
-        for dir in covering_dirs(declared) {
+        for dir in covering_dirs(dirs.iter().map(|entry| entry.path.as_str())) {
             // The bundle is refused at load time for a directory that reaches
             // out of it; an invocation that gets here anyway must not silently
             // sync nothing.
@@ -176,8 +226,8 @@ impl JsPluginExecutor<'_> {
         // Files are passed inline, one entry per declaration: two keys naming
         // the same file are two entries, because the key is what the plugin
         // looks the file up by.
-        let files = Array::new();
-        for entry in &invocation.files {
+        let file_inputs = Array::new();
+        for entry in &inline {
             let path = resolve(&base, &entry.path).map_err(|_| PluginError::Outside {
                 declared: entry.path.clone(),
             })?;
@@ -192,7 +242,7 @@ impl JsPluginExecutor<'_> {
             set(&file, "key", &optional(entry.key.as_deref()));
             set(&file, "name", &JsValue::from_str(&entry.path));
             set(&file, "content", &JsValue::from_str(content));
-            files.push(&file);
+            file_inputs.push(&file);
         }
 
         let fields = Array::new();
@@ -214,12 +264,24 @@ impl JsPluginExecutor<'_> {
             canister_ids.push(&entry);
         }
         let callable = Map::new();
-        for (name, canister_id) in &invocation.callable {
+        for (name, canister_id) in &invocation.callable.by_name {
             callable.set(
                 &JsValue::from_str(name),
                 &JsValue::from_str(&canister_id.to_text()),
             );
         }
+
+        let network = Object::new();
+        set(
+            &network,
+            "apiUrl",
+            &JsValue::from_str(invocation.api_url.as_str()),
+        );
+        set(
+            &network,
+            "gatewayUrl",
+            &optional(invocation.gateway_url.as_ref().map(Url::as_str)),
+        );
 
         // Kept alive across the call, and dropped with it: the host must not
         // hold on to the callback past the run.
@@ -232,15 +294,16 @@ impl JsPluginExecutor<'_> {
         set(
             &request,
             "canisterId",
-            &JsValue::from_str(&invocation.canister_id.to_text()),
+            &JsValue::from_str(&invocation.host_canister_id.to_text()),
         );
         set(
             &request,
             "environment",
             &JsValue::from_str(&invocation.environment),
         );
-        set(&request, "dirs", &dirs);
-        set(&request, "files", &files);
+        set(&request, "network", &network);
+        set(&request, "dirs", &dir_inputs);
+        set(&request, "files", &file_inputs);
         set(&request, "fields", &fields);
         set(&request, "canisterIds", &canister_ids);
         set(&request, "callable", &callable);

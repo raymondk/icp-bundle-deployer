@@ -14,9 +14,8 @@
  * bundle carries.
  *
  * Reading the manifest, installing and syncing are done by
- * [`icp-deploy-canister`](https://github.com/dfinity/icp-cli) — the crate
- * icp-cli itself deploys with — compiled to WebAssembly and wrapped by this
- * library. Nothing about that shows through: the module is loaded for you, and
+ * [`icp-project`](https://github.com/dfinity/icp-cli) — the crate icp-cli
+ * itself deploys with — compiled to WebAssembly and wrapped by this library. Nothing about that shows through: the module is loaded for you, and
  * everything below takes and returns ordinary JavaScript.
  */
 

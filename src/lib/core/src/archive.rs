@@ -6,7 +6,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use icp_deploy_canister::prelude::*;
+use icp_project::prelude::*;
 use snafu::Snafu;
 
 use crate::files::{BundleFiles, normalize};

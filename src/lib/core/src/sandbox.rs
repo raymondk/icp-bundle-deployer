@@ -14,7 +14,7 @@
 //! them has no such multiplicity, which is what [`covering_dirs`] reduces away.
 
 use camino::Utf8Component;
-use icp_deploy_canister::prelude::*;
+use icp_project::prelude::*;
 
 use crate::files::normalize;
 
@@ -50,48 +50,10 @@ pub fn resolve(base: &Path, declared: &str) -> Result<PathBuf, Escape> {
     Ok(path)
 }
 
-/// The meaningful components of a declared entry: the `/`-separated names with
-/// empty and `.` components dropped, so `./data/` and `data` compare equal.
-///
-/// `\` is deliberately not a separator. These comparisons decide what gets
-/// mounted for a guest that will open the entry exactly as written.
-fn components(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect()
-}
-
-/// Reduce declared directories to the ones that actually have to be mounted.
-///
-/// Mounting a directory twice, or mounting one already reachable through an
-/// ancestor, conveys no further access. Callers keep the declared list as
-/// configuration and mount only what this returns; a nested declared directory
-/// is reached through the ancestor covering it.
-///
-/// Retained entries keep their written spelling and first-occurrence order,
-/// because the guest opens each at the spelling the manifest gave it. Comparison
-/// is component-wise, so `data` covers `./data/inner` but not `database`. A
-/// spelling prefix alone is not containment once entries may contain `..`: `..`
-/// is a prefix of `../../shared`, yet one is the canister directory's parent and
-/// the other a child of its grandparent, and neither holds the other.
-pub fn covering_dirs<'a>(dirs: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    let dirs: Vec<&str> = dirs.into_iter().collect();
-    let parts: Vec<Vec<&str>> = dirs.iter().map(|dir| components(dir)).collect();
-    dirs.iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            !parts.iter().enumerate().any(|(j, other)| {
-                j != *i
-                    && parts[*i].starts_with(other)
-                    && !parts[*i][other.len()..].contains(&"..")
-                    // A strict ancestor always covers; between equals, the
-                    // first written wins.
-                    && (other.len() < parts[*i].len() || j < *i)
-            })
-        })
-        .map(|(_, dir)| *dir)
-        .collect()
-}
+// The reduction of declared directories to the trees actually mounted is
+// `icp-project`'s own, since icp-cli's runtime and bundler both apply it; the
+// same rule is applied here so a bundle mounts exactly what the CLI would.
+pub use icp_project::canister::sync::declared::covering_dirs;
 
 #[cfg(test)]
 mod tests {
@@ -118,42 +80,5 @@ mod tests {
         let base = Path::new("/canisters/site");
         assert_eq!(resolve(base, "../../../etc"), Err(Escape::AboveRoot));
         assert_eq!(resolve(base, "/etc"), Err(Escape::NotRelative));
-    }
-
-    #[test]
-    fn keeps_unrelated_directories() {
-        assert_eq!(
-            covering_dirs(["assets", "config", "data/seed"]),
-            ["assets", "config", "data/seed"]
-        );
-    }
-
-    #[test]
-    fn collapses_duplicates_to_the_first_spelling() {
-        assert_eq!(covering_dirs(["./data", "data", "data/"]), ["./data"]);
-    }
-
-    #[test]
-    fn collapses_a_nested_directory_into_its_ancestor() {
-        assert_eq!(covering_dirs(["data", "data/inner"]), ["data"]);
-        assert_eq!(covering_dirs(["data/inner", "data"]), ["data"]);
-        assert_eq!(covering_dirs(["data/a/b", "data/a", "data"]), ["data"]);
-    }
-
-    #[test]
-    fn a_name_prefix_is_not_an_ancestor() {
-        assert_eq!(covering_dirs(["data", "database"]), ["data", "database"]);
-    }
-
-    /// `..` is a spelling prefix of `../../shared` but not an ancestor of it:
-    /// one is the canister directory's parent, the other a child of its
-    /// grandparent.
-    #[test]
-    fn a_rising_entry_does_not_cover_one_that_rises_further() {
-        assert_eq!(
-            covering_dirs(["..", "../../shared"]),
-            ["..", "../../shared"]
-        );
-        assert_eq!(covering_dirs(["..", "../shared"]), [".."]);
     }
 }

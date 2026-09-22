@@ -4,7 +4,7 @@
 //! hands back plain objects and strings, so the library above can present its
 //! own types without any of this showing through.
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use candid::Principal;
 use js_sys::{Function, Promise};
@@ -121,7 +121,9 @@ pub fn deploy_bundle(
     // A borrow cannot outlive an exported function, so the deployment is handed
     // back as a promise over owned state rather than written as an `async fn`.
     Ok(future_to_promise(async move {
-        let host = Host::new(host, caller);
+        // Shared rather than borrowed: the crate's seams are held as `Arc`s, and
+        // the host is what implements them.
+        let host = Arc::new(Host::new(host, caller));
         let emitter = Emitter::new(on_event);
         let result = deploy::deploy(&bundle, &host, &environment, &emitter).await;
         to_js(&result).map_err(JsValue::from)

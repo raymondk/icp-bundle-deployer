@@ -5,12 +5,28 @@
 //! supplied by the host as a single JavaScript object — the calls backed by
 //! agent-js, creation by the cycles ledger client, plugins by jco — and
 //! everything else (what to call, in what order, with which arguments) is
-//! decided here and in `icp-deploy-canister`.
+//! decided here and in `icp-project`. The host also says where the network is,
+//! which nothing here needs but a sync plugin is told.
+//!
+//! `icp-project` reaches canisters through its [`CanisterCalls`] seam, and this
+//! is the browser's implementation of it: every call becomes an ingress message
+//! signed by whichever agent backs the host.
+
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use candid::Principal;
-use icp_deploy_canister::icp_access::{IcpAccess, IcpAccessError};
-use js_sys::{Promise, Uint8Array};
+use icp_project::{
+    calls::{Authority, Call, CallError, CanisterCalls, RouteTo},
+    network::NetworkUrls,
+};
+use js_sys::{Promise, Reflect, Uint8Array};
+use snafu::Snafu;
+use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -21,7 +37,7 @@ export type PluginOutput = (line: string) => void
 
 /**
  * A directory the sync step declared. `key` is the name it was written under
- * when `dirs` is a map, and `undefined` when it is a plain list.
+ * when the setting is a map, and `undefined` when it is a plain list.
  */
 export interface PluginDir {
   key?: string
@@ -48,6 +64,14 @@ export interface PluginCanisterId {
   id: string
 }
 
+/** Where the network a deployment talks to is reached. */
+export interface NetworkUrls {
+  /** The API endpoint calls are submitted to. */
+  apiUrl: string
+  /** The HTTP gateway canisters are served through, when the network has one. */
+  gatewayUrl?: string
+}
+
 /** A fully-resolved sync-plugin step, ready for the jco adapter to run. */
 export interface PluginRequest {
   /** The plugin component, verified against the digest the manifest declared. */
@@ -64,7 +88,13 @@ export interface PluginRequest {
   canisterId: string
   /** Environment name the plugin is told about; informational to it. */
   environment: string
-  /** Every declared directory, in written order, keys and all. */
+  /** Where the network is reached, as the plugin is told it. */
+  network: NetworkUrls
+  /**
+   * The directories the plugin may read, in written order, keys and all. For
+   * a v2 plugin these are the `files:` entries that name a directory in the
+   * bundle; a v1 plugin has a `dirs:` setting of its own.
+   */
   dirs: PluginDir[]
   /** Files the host read up front and passes inline. */
   files: PluginFile[]
@@ -113,6 +143,12 @@ export interface DeployerHost {
   createCanister(): Promise<string>
   /** Runs one sync plugin to completion. */
   runPlugin(request: PluginRequest): Promise<void>
+  /**
+   * Where the network the agent talks to is reached. The deployment itself
+   * calls through `update` and needs neither URL; sync plugins are told both,
+   * so one can say where the canister it synced is served.
+   */
+  network(): NetworkUrls
 }
 "#;
 
@@ -143,6 +179,9 @@ extern "C" {
 
     #[wasm_bindgen(method, catch, js_name = runPlugin)]
     fn run_plugin(this: &DeployerHost, request: &JsValue) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(method, catch)]
+    fn network(this: &DeployerHost) -> Result<JsValue, JsValue>;
 }
 
 /// The host, plus the principal it signs as.
@@ -152,10 +191,9 @@ pub struct Host {
 }
 
 // The generated module is single-threaded, so the JavaScript handles held here
-// can never be reached from another thread. The IO traits in
-// `icp-deploy-canister` require `Send + Sync` because the CLI shares its
-// implementations across tokio tasks; in a browser there is nothing to share
-// with.
+// can never be reached from another thread. The seams in `icp-project` require
+// `Send + Sync` because the CLI shares its implementations across tokio tasks;
+// in a browser there is nothing to share with.
 unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
@@ -221,45 +259,152 @@ impl Host {
         let promise = self.js.run_plugin(request).map_err(|e| describe(&e))?;
         await_js(promise).await.map(|_| ())
     }
+
+    /// Where the network is reached, as the host knows it.
+    pub fn network(&self) -> Result<NetworkUrls, String> {
+        let urls = self.js.network().map_err(|e| describe(&e))?;
+        let api_url = string_property(&urls, "apiUrl")?
+            .ok_or_else(|| "the host named no API URL for the network".to_owned())?;
+        let api_url = Url::parse(&api_url)
+            .map_err(|e| format!("the host's API URL '{api_url}' is not a URL: {e}"))?;
+        let http_gateway_url = match string_property(&urls, "gatewayUrl")? {
+            Some(gateway) => Some(
+                Url::parse(&gateway)
+                    .map_err(|e| format!("the host's gateway URL '{gateway}' is not a URL: {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(NetworkUrls {
+            api_url,
+            http_gateway_url,
+        })
+    }
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl IcpAccess for Host {
-    async fn canister_update(
-        &self,
-        canister: Principal,
-        method: &str,
-        arg: Vec<u8>,
-        effective_canister_id: Principal,
-        cycles: u128,
-    ) -> Result<Vec<u8>, IcpAccessError> {
-        self.update_call(canister, method, arg, effective_canister_id, cycles)
-            .await
-            .map_err(|message| IcpAccessError::Update {
-                canister,
-                method: method.to_owned(),
-                message,
-            })
+/// A call the host could not complete, as it described it.
+#[derive(Debug, Snafu)]
+#[snafu(display("{message}"))]
+pub struct HostError {
+    message: String,
+}
+
+/// A read this host has no way to make. None of them is on a deployment's path;
+/// the seam has them for what icp-cli does besides deploying.
+#[derive(Debug, Snafu)]
+#[snafu(display("a browser deployment cannot {what}"))]
+struct Unsupported {
+    what: &'static str,
+}
+
+#[async_trait]
+impl CanisterCalls for Host {
+    fn caller(&self) -> Principal {
+        self.caller
     }
 
-    async fn read_canister_metadata(
+    async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
+        let Call {
+            canister,
+            method,
+            arg,
+            route,
+            cycles,
+            ..
+        } = call;
+        // The management canister has no routing of its own, so a call to it is
+        // routed to the canister — or subnet — it acts on.
+        let effective = match route {
+            RouteTo::Callee => canister,
+            RouteTo::Canister(target) | RouteTo::Subnet(target) => target,
+        };
+        assume_send(self.update_call(canister, &method, arg, effective, cycles))
+            .await
+            .map_err(|message| CallError::failed(canister, &method, HostError { message }))
+    }
+
+    /// An update call reaches a query method just as well, and the reply is the
+    /// same; the host signs ingress messages and has no separate query path.
+    async fn query(&self, call: Call) -> Result<Vec<u8>, CallError> {
+        self.update(call).await
+    }
+
+    /// Who is reading makes no difference here: the host reads with the one
+    /// identity it has, which is the deployer's own.
+    async fn metadata_section(
         &self,
         canister: Principal,
         path: &str,
-    ) -> Result<Option<Vec<u8>>, IcpAccessError> {
-        self.metadata(canister, path)
+        _authority: Authority,
+    ) -> Result<Option<Vec<u8>>, CallError> {
+        assume_send(self.metadata(canister, path))
             .await
-            .map_err(|message| IcpAccessError::ReadMetadata {
-                canister,
-                path: path.to_owned(),
-                message,
-            })
+            .map_err(|message| CallError::failed(canister, "read_state", HostError { message }))
     }
 
-    fn caller_principal(&self) -> Principal {
-        self.caller
+    async fn controllers(&self, canister: Principal) -> Result<Option<Vec<Principal>>, CallError> {
+        Err(CallError::failed(
+            canister,
+            "read_state",
+            Unsupported {
+                what: "read a canister's controllers",
+            },
+        ))
     }
+
+    async fn module_hash(&self, canister: Principal) -> Result<Option<Vec<u8>>, CallError> {
+        Err(CallError::failed(
+            canister,
+            "read_state",
+            Unsupported {
+                what: "read a canister's module hash",
+            },
+        ))
+    }
+
+    async fn subnet_of(&self, canister: Principal) -> Result<Principal, CallError> {
+        Err(CallError::failed(
+            canister,
+            "read_state",
+            Unsupported {
+                what: "look up a canister's subnet",
+            },
+        ))
+    }
+
+    async fn subnet_uses_engine_operator(&self, subnet: Principal) -> Result<bool, CallError> {
+        Err(CallError::failed(
+            subnet,
+            "read_state",
+            Unsupported {
+                what: "consult the engine registry",
+            },
+        ))
+    }
+}
+
+/// A future the single-threaded module may treat as `Send`.
+///
+/// `icp-project`'s seams are `async_trait` methods, whose futures have to be
+/// `Send` because the CLI drives them from a multi-threaded runtime. A JavaScript
+/// promise is not — nothing from JavaScript is — but the generated module runs
+/// on one thread, so there is no other thread for the future to be sent to.
+/// Saying so is what lets a browser implement the same seams the CLI does.
+pub struct AssumeSend<F>(F);
+
+unsafe impl<F> Send for AssumeSend<F> {}
+
+impl<F: Future> Future for AssumeSend<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        // The wrapped future is never moved out of the wrapper, so pinning the
+        // wrapper pins it.
+        unsafe { self.map_unchecked_mut(|wrapper| &mut wrapper.0) }.poll(cx)
+    }
+}
+
+pub fn assume_send<F: Future>(future: F) -> AssumeSend<F> {
+    AssumeSend(future)
 }
 
 async fn await_js(promise: Promise) -> Result<JsValue, String> {
@@ -271,6 +416,18 @@ fn bytes(value: JsValue) -> Result<Vec<u8>, String> {
         .dyn_ref::<Uint8Array>()
         .map(Uint8Array::to_vec)
         .ok_or_else(|| "the host returned something other than bytes".to_owned())
+}
+
+/// A string property of a plain object, `None` when it is absent or `undefined`.
+fn string_property(object: &JsValue, key: &str) -> Result<Option<String>, String> {
+    let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|e| describe(&e))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_string()
+        .map(Some)
+        .ok_or_else(|| format!("the host's '{key}' is not a string"))
 }
 
 /// A JavaScript rejection, as a message worth showing. An `Error` carries the

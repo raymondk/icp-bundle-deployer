@@ -5,7 +5,6 @@
 //! plain JavaScript objects; the library around this module turns them into
 //! whatever the page shows.
 
-use icp_deploy_canister::sync_exec::StepProgress;
 use js_sys::Function;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -87,11 +86,5 @@ impl ProgressSink {
             name: self.canister.clone(),
             message,
         });
-    }
-}
-
-impl StepProgress for ProgressSink {
-    fn line(&self, line: String) {
-        ProgressSink::line(self, line);
     }
 }

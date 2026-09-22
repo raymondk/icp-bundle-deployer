@@ -2,9 +2,9 @@
 //!
 //! This is the deployment core of the library in `src/lib`, compiled to
 //! WebAssembly. It reads a bundle, holds it to the rules a bundle has to follow,
-//! and then deploys it through `icp-deploy-canister` — the same crate icp-cli
-//! deploys with, so a bundle is installed and synced the way the CLI would
-//! install and sync it, not the way a reimplementation guessed.
+//! and then deploys it through `icp-project` — the same crate icp-cli deploys
+//! with, so a bundle is installed and synced the way the CLI would install and
+//! sync it, not the way a reimplementation guessed.
 //!
 //! Everything that needs the network or a component runtime is the host's:
 //! signing calls, creating canisters, running sync plugins. See [`host`].
@@ -18,6 +18,7 @@ pub mod abi;
 pub mod archive;
 pub mod bundle;
 pub mod files;
+pub mod recipe;
 pub mod sandbox;
 pub mod settings;
 
