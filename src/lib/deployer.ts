@@ -1,18 +1,21 @@
 /**
  * The library's entry point: a deployer bound to one agent.
  *
- * Everything a deployment needs beyond the bundle itself comes from the agent — who
- * it signs as, which network it talks to, and therefore which environment name sync
- * plugins are told about. That leaves one decision at the call site: the bundle, and
- * optionally the subnet to put it on.
+ * Everything a deployment needs beyond the bundle itself comes from the agent —
+ * who it signs as, which network it talks to, and therefore which environment
+ * the manifest is read for. That leaves one decision at the call site: the
+ * bundle, and optionally the subnet to put it on.
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
 import { Principal } from '@icp-sdk/core/principal'
-import { loadBundle, type Bundle, type BundleSource } from './bundle'
-import { deployBundle, type DeployEvent, type DeployResult } from './deploy'
+import { Bundle, isBundle, loadBundle, type BundleSource } from './bundle'
+import type { DeployEvent, DeployResult } from './events'
+import { createHost } from './host'
 import { DEFAULT_CREATION_CYCLES } from './ic/create'
 import { isMainnetRootKey } from './ic/root-key'
+import { initialize } from './init'
+import { deployBundle } from './wasm/deployer'
 
 export interface DeployerOptions {
   /** Signs every call. Its principal controls what the deployment creates. */
@@ -20,17 +23,18 @@ export interface DeployerOptions {
   /** Cycles used to fund each canister. Defaults to the 2T `icp deploy` uses. */
   cycles?: bigint
   /**
-   * Environment name passed to sync plugins. Derived from the agent's root key when
-   * omitted — `ic` on mainnet, `local` anywhere else — which is informational to the
-   * plugin either way.
+   * The environment the manifest is read for, which decides which of its
+   * overrides apply and what sync plugins are told they are running against.
+   * Derived from the agent's root key when omitted — `ic` on mainnet, `local`
+   * anywhere else.
    */
   environment?: string
 }
 
 export interface DeployOptions {
   /**
-   * Put every canister on this subnet, as `icp deploy --subnet` does. Omitted, one
-   * subnet is resolved for the whole bundle so its canisters stay together.
+   * Put every canister on this subnet, as `icp deploy --subnet` does. Omitted,
+   * one subnet is resolved for the whole bundle so its canisters stay together.
    */
   subnet?: Principal | string
   /** Progress as it happens: creation, settings, installs, plugin output. */
@@ -39,9 +43,9 @@ export interface DeployOptions {
 
 export interface Deployer {
   /**
-   * Unpacks and verifies a bundle without deploying anything, for inspecting what a
-   * bundle contains before committing to it. `deploy` accepts the result, or the
-   * same sources directly.
+   * Unpacks and verifies a bundle without deploying anything, for inspecting
+   * what a bundle contains before committing to it. `deploy` accepts the result,
+   * or the same sources directly.
    */
   load(source: BundleSource): Promise<Bundle>
   deploy(source: BundleSource, options?: DeployOptions): Promise<DeployResult>
@@ -55,19 +59,69 @@ export function createDeployer({
   return {
     load: (source) => loadBundle(source),
 
-    async deploy(source, { subnet, onEvent } = {}) {
+    async deploy(source, { subnet, onEvent = () => {} } = {}) {
       const bundle = await loadBundle(source)
+      // A bundle the caller passed in stays theirs to dispose of. One loaded here
+      // has no other owner, and holds the whole uncompressed archive.
+      const owned = !isBundle(source)
+      await initialize()
 
-      return deployBundle({
-        bundle,
-        agent,
-        identityPrincipal: await agent.getPrincipal(),
-        subnet: subnet === undefined ? undefined : toPrincipal(subnet),
-        cycles,
-        environment: environment ?? environmentOf(agent),
-        onEvent,
-      })
+      try {
+        const identityPrincipal = await agent.getPrincipal()
+        const host = createHost({
+          agent,
+          identityPrincipal,
+          cycles,
+          subnet: subnet === undefined ? undefined : toPrincipal(subnet),
+          onEvent,
+        })
+
+        const result = await deployBundle(
+          Bundle.core(bundle),
+          host,
+          identityPrincipal.toText(),
+          environment ?? environmentOf(agent),
+          (event: RawEvent) => onEvent(enrich(event)),
+        )
+
+        return enrichResult(result as RawResult)
+      } finally {
+        if (owned) bundle.dispose()
+      }
     },
+  }
+}
+
+/** The module reports canister ids as text; the library hands back principals. */
+type WithTextIds<Event> = Event extends { canisterId: Principal }
+  ? Omit<Event, 'canisterId'> & { canisterId: string }
+  : Event
+/**
+ * An event as the module serializes it. Distributed over the union one member at
+ * a time on purpose: `Omit` over a union keeps only the keys its members share,
+ * which here is `type` alone, so a single `Omit` would check none of the rest.
+ */
+type RawEvent = WithTextIds<DeployEvent>
+type RawResult = {
+  deployed: { name: string; canisterId: string }[]
+  incomplete: { name: string; canisterId: string }[]
+  error?: string
+}
+
+function enrich(event: RawEvent): DeployEvent {
+  return 'canisterId' in event
+    ? { ...event, canisterId: Principal.fromText(event.canisterId) }
+    : event
+}
+
+function enrichResult(result: RawResult): DeployResult {
+  const canisters = (list: RawResult['deployed']) =>
+    list.map(({ name, canisterId }) => ({ name, canisterId: Principal.fromText(canisterId) }))
+
+  return {
+    deployed: canisters(result.deployed),
+    incomplete: canisters(result.incomplete),
+    error: result.error,
   }
 }
 

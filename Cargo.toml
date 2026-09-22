@@ -1,0 +1,16 @@
+[workspace]
+# The deployment core is part of the library in `src/lib`, not a separate
+# component of this project: it lives beside the JavaScript that wraps it so the
+# whole directory lifts out as one unit.
+members = ["src/lib/core"]
+resolver = "3"
+
+[profile.release]
+# The module ships to a browser, so size is the thing worth optimizing. Stripping
+# is left to wasm-opt: `strip = true` would also take the `target_features`
+# section rustc emits, which is how wasm-opt knows which wasm features the module
+# was built with.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
