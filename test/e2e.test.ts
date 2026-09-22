@@ -3,7 +3,7 @@
  *
  * Needs a running local network (`icp network start -d`) and funds the identity it
  * signs as via `icp cycles transfer`, exactly as a user would. Everything here goes
- * through the same modules the page uses, including the sync plugin, so a pass
+ * through the same modules the page uses, both sync plugins included, so a pass
  * means the deployment path works end to end and not just in parts.
  */
 
@@ -36,14 +36,19 @@ const agent = await HttpAgent.create({ host: HOST, identity, shouldFetchRootKey:
 console.log(`identity: ${principal.toText()}`)
 execFileSync('icp', ['cycles', 'transfer', '20t', principal.toText()], { stdio: 'ignore' })
 
-// The library, used exactly as its README shows.
-const deployer = createDeployer({ agent })
+// The library, used exactly as its README shows. The gateway is named so a sync
+// plugin is told one: on a local network nothing else could tell it.
+const deployer = createDeployer({ agent, gatewayUrl: HOST })
 const fixture = await fullstackBundle()
 const bundle = await deployer.load(new File([fixture.bytes as BlobPart], 'e2e.icp'))
+
+// What the script plugin printed while it ran, as the deployment reported it.
+const scriptOutput: string[] = []
 
 const result = await deployer.deploy(bundle, {
   onEvent: (event) => {
     if (event.type === 'failed') console.log(`    ! ${event.message}`)
+    if (event.type === 'progress' && event.name === 'plain') scriptOutput.push(event.message)
   },
 })
 
@@ -168,6 +173,56 @@ test('serves clean URLs', async () => {
 test('serves a 404 for an unknown path', async () => {
   const response = await fetch(`${gatewayUrl(deployed('site').canisterId)}/nope`)
   assertEqual(response.status, 404, 'unknown paths should 404')
+})
+
+group('script sync')
+
+// The script plugin speaks `icp:sync-plugin@0.2`, so this is the path that hands a
+// plugin named entries, the network URLs, the step's fields and the canister
+// table — none of which the asset plugin above takes. The page it uploaded is
+// where each of those becomes visible from outside.
+const scriptPage = async (): Promise<Record<string, string>> => {
+  // Asked for by its key: serving `/` as the index is a rewrite rule the asset
+  // plugin installs, and the script uploaded one asset and no rules.
+  const response = await fetch(`${gatewayUrl(deployed('plain').canisterId)}/index.html`)
+  assertEqual(response.status, 200, 'the script should have uploaded an index page')
+  const pre = /<pre>\n([\s\S]*?)<\/pre>/.exec(await response.text())
+  assert(pre, 'the page should carry the values the script read')
+  return Object.fromEntries(
+    pre[1]
+      .trim()
+      .split('\n')
+      .map((line) => line.split(/: (.*)/s).slice(0, 2)),
+  )
+}
+
+test('runs the script the step declared and serves what it uploaded', async () => {
+  const page = await scriptPage()
+  assertEqual(page.greeting, fixture.script.greeting, 'a `fields:` entry reaches the script')
+  assertEqual(page.config, fixture.script.config, 'a declared file reaches the script inline')
+  assertEqual(page.dirs, 'canisters/plain/pages', 'a declared directory is mounted where it was written')
+})
+
+test('tells the script about the network and the environment', async () => {
+  const page = await scriptPage()
+  assertEqual(page.environment, 'local', 'environment name')
+  assertEqual(page.apiUrl, `${HOST}/`, "the agent's host is the API URL")
+  assertEqual(page.gatewayUrl, `${HOST}/`, 'the gateway the deployer was given')
+  assertEqual(page.identity, principal.toText(), 'the identity the deployment signs as')
+})
+
+test('resolves the canisters the script may reach', async () => {
+  const page = await scriptPage()
+  assertEqual(page.self, deployed('plain').canisterId.toText(), 'the canister being synced')
+  assertEqual(page.site, deployed('site').canisterId.toText(), 'the canister table names the sibling')
+  assert(/^\d+\.\d+\.\d+$/.test(page.siteVersion), `a typed call to the sibling answered: ${page.siteVersion}`)
+})
+
+test("streams the script's output as progress", () => {
+  assert(
+    scriptOutput.some((line) => line.startsWith('uploaded /index.html')),
+    `the line the script printed should have been reported, got: ${scriptOutput.join(' | ')}`,
+  )
 })
 
 function gatewayUrl(canisterId: Principal): string {
