@@ -18,8 +18,9 @@ import {
   subnetOf,
   type DeployedCanister,
 } from '../src/lib'
+import { createRegistry, RegistryError, type ApplicationInput } from '../src/app/registry'
 import { fullstackBundle } from './support/fixtures'
-import { assert, assertEqual, group, run, test } from './support/harness'
+import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { canisterStatus } from './support/status'
 import { loadModule } from './support/wasm'
 
@@ -34,6 +35,14 @@ const agent = await HttpAgent.create({ host: HOST, identity, shouldFetchRootKey:
 
 console.log(`identity: ${principal.toText()}`)
 execFileSync('icp', ['cycles', 'transfer', '20t', principal.toText()], { stdio: 'ignore' })
+
+// The registry the page records applications in, deployed the way the project
+// deploys it. Its records outlive a run; the identity above is fresh, so nothing
+// from an earlier run is under its name.
+execFileSync('icp', ['deploy', 'registry'], { stdio: 'ignore' })
+const registryId = Principal.fromText(
+  execFileSync('icp', ['canister', 'status', 'registry', '-i'], { encoding: 'utf-8' }).trim(),
+)
 
 // The library, used exactly as its README shows. The gateway is named so a sync
 // plugin is told one: on a local network nothing else could tell it.
@@ -220,6 +229,75 @@ test("streams the script's output as progress", () => {
     scriptOutput.some((line) => line.startsWith('uploaded /index.html')),
     `the line the script printed should have been reported, got: ${scriptOutput.join(' | ')}`,
   )
+})
+
+group('registry')
+
+// Driven through the same client module the page uses, against the canister
+// `icp deploy` put up: every method is scoped to the caller, so a second
+// identity sees nothing of the first's, and an anonymous one nothing at all.
+const registry = createRegistry(agent, registryId)
+
+const record = (name: string): ApplicationInput => ({
+  name,
+  bundleSha256: 'a'.repeat(64),
+  bundleFileName: `${name}-1.0.0.icp`,
+  canisters: [
+    { name: 'plain', canisterId: deployed('plain').canisterId, state: 'deployed' },
+    { name: 'site', canisterId: deployed('site').canisterId, state: 'unfinished' },
+  ],
+})
+
+test('creates an application and stamps it', async () => {
+  const created = await registry.create(record('shop'))
+  assertEqual(created.name, 'shop', 'name')
+  assertEqual(created.created.getTime(), created.updated.getTime(), 'a new record has one time')
+  assert(Math.abs(Date.now() - created.created.getTime()) < 5 * 60_000, 'stamped by the registry, now')
+  assertEqual(created.canisters[1]?.state, 'unfinished', 'canister states round-trip')
+})
+
+test('lists newest deployment first', async () => {
+  await registry.create(record('blog'))
+  await registry.update(record('shop'))
+  const names = (await registry.list()).map((application) => application.name)
+  assertEqual(names.join(','), 'shop,blog', 'the updated one comes first')
+})
+
+test('updates in place, keeping when it was created', async () => {
+  const before = (await registry.get('shop'))!
+  const after = await registry.update({ ...record('shop'), bundleFileName: 'shop-2.0.0.icp' })
+  assertEqual(after.created.getTime(), before.created.getTime(), 'created is kept')
+  assert(after.updated.getTime() >= before.updated.getTime(), 'updated moves forward')
+  assertEqual((await registry.get('shop'))?.bundleFileName, 'shop-2.0.0.icp', 'the record changed')
+})
+
+test('refuses a second application with the same name', async () => {
+  await assertRejects(() => registry.create(record('shop')), /already have an application named "shop"/, 'duplicate')
+  try {
+    await registry.create(record('shop'))
+  } catch (error) {
+    assert(error instanceof RegistryError && error.refusal.kind === 'alreadyExists', 'typed refusal')
+  }
+})
+
+test('refuses updating an application the caller does not have', async () => {
+  await assertRejects(() => registry.update(record('nope')), /no application named "nope"/, 'not found')
+  assertEqual(await registry.get('nope'), undefined, 'and get says so')
+})
+
+test('shows another principal nothing of these', async () => {
+  const other = await HttpAgent.create({
+    host: HOST,
+    identity: Ed25519KeyIdentity.generate(),
+    shouldFetchRootKey: true,
+  })
+  assertEqual((await createRegistry(other, registryId).list()).length, 0, 'records are per caller')
+})
+
+test('refuses an anonymous caller', async () => {
+  const anonymous = createRegistry(await HttpAgent.create({ host: HOST, shouldFetchRootKey: true }), registryId)
+  await assertRejects(() => anonymous.create(record('anon')), /sign in first/i, 'anonymous create')
+  await assertRejects(() => anonymous.list(), /anonymous/i, 'anonymous list')
 })
 
 function gatewayUrl(canisterId: Principal): string {
