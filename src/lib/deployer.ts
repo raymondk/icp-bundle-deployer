@@ -12,10 +12,12 @@ import { Principal } from '@icp-sdk/core/principal'
 import { Bundle, isBundle, loadBundle, type BundleSource } from './bundle'
 import type { DeployEvent, DeployResult } from './events'
 import { createHost } from './host'
-import { DEFAULT_CREATION_CYCLES } from './ic/create'
 import { isMainnetRootKey } from './ic/root-key'
 import { initialize } from './init'
 import { deployBundle } from './wasm/deployer'
+
+/** What each created canister is funded with — the default `icp deploy` uses. */
+export const DEFAULT_CREATION_CYCLES = 2_000_000_000_000n
 
 export interface DeployerOptions {
   /** Signs every call. Its principal controls what the deployment creates. */
@@ -45,7 +47,7 @@ export interface DeployOptions {
    * one subnet is resolved for the whole bundle so its canisters stay together.
    */
   subnet?: Principal | string
-  /** Progress as it happens: creation, settings, installs, plugin output. */
+  /** Progress as it happens: phases, creation, installs, plugin output. */
   onEvent?: (event: DeployEvent) => void
 }
 
@@ -77,20 +79,15 @@ export function createDeployer({
 
       try {
         const identityPrincipal = await agent.getPrincipal()
-        const host = createHost({
-          agent,
-          identityPrincipal,
-          cycles,
-          subnet: subnet === undefined ? undefined : toPrincipal(subnet),
-          gatewayUrl,
-          onEvent,
-        })
+        const host = createHost({ agent, identityPrincipal, gatewayUrl })
 
         const result = await deployBundle(
           Bundle.core(bundle),
           host,
           identityPrincipal.toText(),
           environment ?? environmentOf(agent),
+          subnet === undefined ? undefined : toPrincipal(subnet).toText(),
+          cycles.toString(),
           (event: RawEvent) => onEvent(enrich(event)),
         )
 

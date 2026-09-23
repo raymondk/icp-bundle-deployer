@@ -14,18 +14,28 @@ crate-type = ["cdylib", "rlib"]
 # of those seams for a machine with a filesystem and subprocesses, which a
 # browser has none of; leaving it off is also what upstream's CI checks builds
 # for `wasm32-unknown-unknown`.
-icp-project = { git = "https://github.com/dfinity/icp-cli", rev = "0964d4a6d52c85b46ba3c6da952d3dab0a004391", default-features = false }
-# The progress-reporting handles `icp-project`'s seams take; a plugin runner is
-# handed one, so the type has to be nameable here.
-icp-events = { git = "https://github.com/dfinity/icp-cli", rev = "0964d4a6d52c85b46ba3c6da952d3dab0a004391" }
+#
+# Pinned to a branch of a fork rather than to upstream `main`: the deploy
+# operation waits on the clock before syncing, and upstream reaches the clock
+# through tokio's timers, which have nothing to run on in a browser. The branch
+# is upstream at `0964d4a` plus one commit that makes the wait go through a
+# `Timer` seam on the operations `Host`, the way randomness already does. It is
+# meant to be proposed upstream; once it lands, this goes back to a `main` rev.
+icp-project = { git = "https://github.com/raymondk/icp-cli", rev = "b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8", default-features = false }
+# The progress-reporting handles `icp-project`'s seams take, and the event stream
+# its deploy operation reports on.
+icp-events = { git = "https://github.com/raymondk/icp-cli", rev = "b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8" }
+# The engine registry's interface, for telling a cloud engine's subnet from an
+# ordinary one the way icp-cli's deploy expects to be told.
+icp-canister-interfaces = { git = "https://github.com/raymondk/icp-cli", rev = "b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8" }
 
 async-trait = "0.1.88"
 camino = "1.1.9"
 candid = "0.10.19"
 console_error_panic_hook = "0.1.7"
 flate2 = { version = "1.1.8", default-features = false, features = ["rust_backend"] }
+futures = "0.3.31"
 hex = "0.4.3"
-ic-management-canister-types = "0.9.0"
 js-sys = "0.3.77"
 serde = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
@@ -38,8 +48,12 @@ wasm-bindgen-futures = "0.4.50"
 wasmparser = { version = "0.258.0", default-features = false, features = ["component-model"] }
 
 [dev-dependencies]
-# Loading a bundle is only nominally async — nothing it reads can block — so a
-# bare executor is all the tests need to drive it.
-futures = "0.3.31"
+# The same crate with its test doubles switched on: a randomness source that
+# always picks first, a clock on which no time has to pass. A dev-dependency's
+# features reach only `cargo test`, so none of it is in the shipped module.
+icp-project = { git = "https://github.com/raymondk/icp-cli", rev = "b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8", default-features = false, features = ["test-util"] }
+# The management canister's argument and reply types, for a test double that
+# answers as it would.
+ic-management-canister-types = "0.9.0"
 indoc = "2.0.6"
 wasm-encoder = "0.258"

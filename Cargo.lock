@@ -868,6 +868,7 @@ dependencies = [
  "futures",
  "hex",
  "ic-management-canister-types 0.9.0",
+ "icp-canister-interfaces",
  "icp-events",
  "icp-project",
  "indoc",
@@ -887,7 +888,7 @@ dependencies = [
 [[package]]
 name = "icp-canister-interfaces"
 version = "1.5.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=0964d4a6d52c85b46ba3c6da952d3dab0a004391#0964d4a6d52c85b46ba3c6da952d3dab0a004391"
+source = "git+https://github.com/raymondk/icp-cli?rev=b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8#b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8"
 dependencies = [
  "bigdecimal",
  "candid",
@@ -898,7 +899,7 @@ dependencies = [
 [[package]]
 name = "icp-events"
 version = "1.5.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=0964d4a6d52c85b46ba3c6da952d3dab0a004391#0964d4a6d52c85b46ba3c6da952d3dab0a004391"
+source = "git+https://github.com/raymondk/icp-cli?rev=b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8#b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8"
 dependencies = [
  "serde",
  "tokio",
@@ -907,7 +908,7 @@ dependencies = [
 [[package]]
 name = "icp-project"
 version = "1.5.0"
-source = "git+https://github.com/dfinity/icp-cli?rev=0964d4a6d52c85b46ba3c6da952d3dab0a004391#0964d4a6d52c85b46ba3c6da952d3dab0a004391"
+source = "git+https://github.com/raymondk/icp-cli?rev=b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8#b1598bcb8900e40f2824a73b5b4f4d48fb3ba5e8"
 dependencies = [
  "async-trait",
  "bigdecimal",

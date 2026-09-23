@@ -65,12 +65,29 @@ interface PluginModule {
 /**
  * Builds the plugin runner the module calls, bound to the agent whose identity
  * the deployment signs as.
+ *
+ * One plugin runs at a time. The deployment syncs every canister in one phase
+ * and starts their plugins together, but the WASI world a plugin runs in is
+ * process-wide state in `preview2-shim` — one set of preopened directories, one
+ * pair of stdout/stderr hooks — so two sandboxes alive at once would each see
+ * the other's mounts and take the other's output. Queueing the runs keeps the
+ * phase as the deployment ordered it while giving each plugin the world its
+ * step declared.
  */
 export function createPluginRunner(
   agent: HttpAgent,
   identityPrincipal: Principal,
 ): (request: PluginRequest) => Promise<void> {
-  return async (request) => {
+  let previous: Promise<unknown> = Promise.resolve()
+  return (request) => {
+    // A failed run must not block the ones queued behind it: they report their
+    // own outcome to the deployment.
+    const run = previous.then(() => runPlugin(request), () => runPlugin(request))
+    previous = run
+    return run
+  }
+
+  async function runPlugin(request: PluginRequest): Promise<void> {
     if (!supportsJspi()) {
       throw new SyncError(
         'This browser cannot run sync plugins: it lacks WebAssembly JSPI, which lets the ' +

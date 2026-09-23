@@ -9,18 +9,15 @@
 //!
 //! The plugin is the same wasm `icp sync` runs, so what lands on the canister —
 //! compression, clean URLs, redirect rules, the resulting state hash — matches a
-//! CLI deployment rather than approximating it.
+//! CLI deployment rather than approximating it. What it prints goes out on the
+//! step reporter the invocation carries, as icp-cli's runtime reports it, and
+//! reaches the page from there.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use icp_events::StepReporter;
 use icp_project::{
-    canister::{
-        sync::plugin::{Invocation, KeyedPath, Run, RunError},
-        wasm::{Fetch, FetchError},
-    },
-    manifest::prebuilt::SourceField,
+    canister::sync::plugin::{Invocation, KeyedPath, Run, RunError},
     prelude::*,
 };
 use js_sys::{Array, Function, Map, Object, Reflect, Uint8Array};
@@ -30,72 +27,10 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     abi::{PluginAbi, plugin_abi},
-    bundle::sha256_hex,
-    events::ProgressSink,
     files::{BundleFiles, normalize},
     host::{Host, assume_send},
     sandbox::{covering_dirs, resolve},
 };
-
-/// Why a plugin wasm could not be produced.
-#[derive(Debug, Snafu)]
-pub enum WasmError {
-    #[snafu(display(
-        "the plugin is referenced by URL, and a bundle must carry every plugin it runs"
-    ))]
-    Remote,
-
-    #[snafu(display("the plugin wasm '{path}' is not in the bundle"))]
-    Missing { path: PathBuf },
-
-    #[snafu(display(
-        "the plugin wasm '{path}' does not match its declared digest\n  expected {expected}\n  \
-         actual   {actual}"
-    ))]
-    Digest {
-        path: PathBuf,
-        expected: String,
-        actual: String,
-    },
-}
-
-/// Serves the plugin wasms the bundle carries, and nothing that would have to
-/// be fetched. `icp-project` asks for a path rather than bytes, since icp-cli's
-/// runtime loads the component off disk; here the path is the key the bytes are
-/// read back by.
-pub struct BundleWasm(pub BundleFiles);
-
-#[async_trait]
-impl Fetch for BundleWasm {
-    async fn wasm(
-        &self,
-        source: &SourceField,
-        base_dir: &Path,
-        sha256: Option<&str>,
-        _reporter: &StepReporter,
-    ) -> Result<PathBuf, FetchError> {
-        let SourceField::Local(source) = source else {
-            return Err(FetchError::new(WasmError::Remote));
-        };
-        let path = normalize(&base_dir.join(&source.path));
-        let wasm = self
-            .0
-            .get(&path)
-            .ok_or_else(|| FetchError::new(WasmError::Missing { path: path.clone() }))?;
-
-        if let Some(expected) = sha256 {
-            let actual = sha256_hex(wasm);
-            if !expected.eq_ignore_ascii_case(&actual) {
-                return Err(FetchError::new(WasmError::Digest {
-                    path,
-                    expected: expected.to_owned(),
-                    actual,
-                }));
-            }
-        }
-        Ok(path)
-    }
-}
 
 #[derive(Debug, Snafu)]
 pub enum PluginError {
@@ -121,20 +56,17 @@ pub enum PluginError {
     Host { message: String },
 }
 
-/// Runs sync plugins through the host's jco adapter.
+/// Runs sync plugins through the host's jco adapter. One runner serves every
+/// canister: which canister an invocation is about, and where its output goes,
+/// arrive with the invocation.
 pub struct JsPluginRunner {
     host: Arc<Host>,
     files: BundleFiles,
-    progress: ProgressSink,
 }
 
 impl JsPluginRunner {
-    pub fn new(host: Arc<Host>, files: BundleFiles, progress: ProgressSink) -> Self {
-        Self {
-            host,
-            files,
-            progress,
-        }
+    pub fn new(host: Arc<Host>, files: BundleFiles) -> Self {
+        Self { host, files }
     }
 }
 
@@ -283,10 +215,12 @@ impl JsPluginRunner {
             &optional(invocation.gateway_url.as_ref().map(Url::as_str)),
         );
 
-        // Kept alive across the call, and dropped with it: the host must not
-        // hold on to the callback past the run.
-        let sink = self.progress.clone();
-        let on_output = Closure::<dyn Fn(String)>::new(move |line: String| sink.line(line));
+        // Each line goes out on the step's reporter as the plugin prints it,
+        // which is where icp-cli's runtime reports a plugin's output too. Kept
+        // alive across the call, and dropped with it: the host must not hold
+        // on to the callback past the run.
+        let reporter = invocation.reporter.clone();
+        let on_output = Closure::<dyn Fn(String)>::new(move |line: String| reporter.stdout(line));
 
         let request = Object::new();
         set(&request, "wasm", &Uint8Array::from(wasm));
