@@ -12,3 +12,10 @@ canisters:
           - npm install
           - npm run build
         dir: dist
+
+  # Where the page records the applications a user deploys with it, one
+  # canister per network. Built with `mops build` through the Motoko recipe;
+  # the toolchain and the canister's entry point are in mops.toml.
+  - name: registry
+    recipe:
+      type: "@dfinity/motoko@v5.1.0"

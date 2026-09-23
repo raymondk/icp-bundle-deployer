@@ -126,6 +126,25 @@ tokio's timers, which have nothing to run on in wasm. Until that wait goes throu
 upstream, the core builds against a branch of a fork that is upstream plus that one change
 ([`Cargo.toml`](./src/lib/core/Cargo.toml) says which).
 
+## Your applications
+
+Signed in, the page lists the applications you have deployed with it, newest deployment
+first. Each entry opens to the canisters it consists of — the manifest name and the canister
+id — with a badge on any canister that is unfinished or orphaned. The list is per
+principal: signing in as someone else shows their applications, not yours.
+
+The records live in a **registry canister** that ships with the page, one per network,
+written in Motoko (`src/registry/`). It is caller-scoped throughout: every method operates
+on the caller's own records, anonymous calls are refused, and nobody can read another
+principal's list. The page finds it the same way the bundles it deploys find their own
+canisters — through `PUBLIC_CANISTER_ID:registry` in the certified `ic_env` cookie the
+asset canister serves.
+
+The canister builds with `mops build` through the `@dfinity/motoko` recipe, so the Motoko
+toolchain is pinned in [`mops.toml`](./mops.toml) rather than in `icp.yaml`. Its records
+are what an upgrade will be seeded from; recording an installation and upgrading one are
+follow-ups.
+
 ## Choosing a subnet
 
 A deployment lands on exactly one subnet, resolved once before anything is created, so
@@ -243,7 +262,9 @@ canister from the root's own `backend`.
 
 Requires [icp-cli](https://cli.internetcomputer.org/) 1.x and Node.js, plus a Rust
 toolchain with the `wasm32-unknown-unknown` target and
-[`wasm-pack`](https://drager.github.io/wasm-pack/) to build the library's Rust core.
+[`wasm-pack`](https://drager.github.io/wasm-pack/) to build the library's Rust core, and
+[`mops`](https://mops.one/docs/install) and [`ic-wasm`](https://github.com/dfinity/ic-wasm)
+to build the registry canister (`mops` fetches the Motoko compiler itself).
 
 ```bash
 npm install
@@ -263,18 +284,21 @@ icp cycles transfer 10t <the principal the page shows>
 Deploying with too small a balance fails before anything is created, reporting the
 shortfall.
 
-Open the deployer from its canister URL rather than the Vite dev server: it learns the
-network's root key from the asset canister's `ic_env` cookie, which the dev server does not
-serve. `npm run dev` is fine for working on the page itself.
+The page learns the network's root key, and where the registry is, from the `ic_env`
+cookie the asset canister certifies. `npm run dev` serves the same cookie itself: at start
+it reads the running local network's root key and API URL and the registry's id, sets the
+cookie on every response, and proxies `/api` to the network — so deploy the registry first
+(`icp deploy registry`), then work on the page against the dev server as it would behave
+from its canister URL.
 
-For the same reason, [`icp.yaml`](./icp.yaml) pins `@dfinity/static-site` at `v0.3.3` or
-later — earlier releases do not serve the `ic_env` cookie that network detection reads.
+[`icp.yaml`](./icp.yaml) pins `@dfinity/static-site` at `v0.3.3` or later — earlier
+releases do not serve the `ic_env` cookie that network detection reads.
 
 ## Tests
 
 ```bash
-npm test         # offline: unpacking, manifest validation, integrity
-npm run test:e2e # deploys a real bundle to the local network
+npm test         # offline: unpacking, manifest validation, integrity, the registry's rules
+npm run test:e2e # deploys a real bundle, and the registry, to the local network
 ```
 
 The offline suite builds tar archives in memory, so it needs no fixtures and no
@@ -287,12 +311,20 @@ on. The core also drives the deploy operation against a stand-in network there, 
 the one thing this deployer adds around it: a canister whose id is already in the store is
 not created again and is installed in the mode its status calls for.
 
+The registry's rules — what a name may be, that a name is reserved per caller, that an
+update keeps `created` and bumps `updated`, that callers see only their own records and an
+anonymous caller none — are Motoko unit tests under `test/*.test.mo`, run with `mops test`
+(`npm test` includes them). The caller and the clock are parameters of the module the
+actor delegates to, which is what lets them run without a replica.
+
 The e2e suite needs a running local network (`icp network start -d`). It builds a
 two-canister bundle from the published certified-assets release (cached under
 `.cache/` after the first run), funds a fresh identity with `icp cycles transfer`,
 deploys through the same modules the page uses, and then checks the result from
 outside: module hashes, controllers, colocation on one subnet, the injected canister
-IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
+IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404. It also
+deploys the registry with `icp deploy registry` and drives create, list, update and the
+refusals through the same client module the page uses.
 
 ## Layout
 
@@ -306,8 +338,9 @@ IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
 | `src/lib/plugin/` | plugin transpilation, the WASI sandbox, the plugin's canister imports |
 | `src/lib/core/` | the Rust core: the archive, the manifest, the seams the deploy operation runs against |
 | `src/lib/wasm/` | the compiled core, generated by `npm run build:lib` |
-| `src/app/` | the page: network detection, Internet Identity, UI |
-| `test/` | the offline and e2e suites |
+| `src/app/` | the page: network detection, Internet Identity, the registry client, UI |
+| `src/registry/` | the registry canister, in Motoko: types, rules, interface |
+| `test/` | the offline, Motoko and e2e suites |
 
 ## Deploying to mainnet
 

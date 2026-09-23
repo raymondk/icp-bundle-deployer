@@ -256,3 +256,31 @@ button.primary {
     color: #fff;
   }
 }
+
+.applications {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.applications li + li {
+  margin-top: 0.5rem;
+}
+.application summary {
+  cursor: pointer;
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.application[open] summary {
+  margin-bottom: 0.5rem;
+}
+.badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 0 0.4rem;
+  border: 1px solid currentColor;
+  border-radius: 0.25rem;
+  vertical-align: middle;
+}

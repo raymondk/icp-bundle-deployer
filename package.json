@@ -8,7 +8,8 @@
     "dev": "npm run build:lib && vite",
     "build": "npm run build:lib && tsc && vite build",
     "preview": "vite preview",
-    "test": "npm run build:lib && cargo test --manifest-path src/lib/core/Cargo.toml && tsc -p tsconfig.test.json && tsx test/offline.test.ts",
+    "test": "npm run build:lib && cargo test --manifest-path src/lib/core/Cargo.toml && mops test && tsc -p tsconfig.test.json && tsx test/offline.test.ts",
+    "test:motoko": "mops test",
     "test:e2e": "npm run build:lib && tsc -p tsconfig.test.json && tsx --import ./test/support/register-shim.mjs --experimental-wasm-jspi test/e2e.test.ts"
   },
   "devDependencies": {

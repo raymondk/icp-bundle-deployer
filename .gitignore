@@ -36,3 +36,6 @@ bundles/
 # Rust build output and the generated wasm module (rebuilt by `npm run build:lib`)
 /target
 src/lib/wasm/
+
+# mops dependencies and build output (restored by `mops install`, rebuilt by `mops build`)
+.mops/

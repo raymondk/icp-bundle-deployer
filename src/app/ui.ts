@@ -20,6 +20,7 @@ import {
 } from '../lib'
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from './auth'
 import { createAgent, describeNetwork, type Network } from './network'
+import { createRegistry, type Application } from './registry'
 
 interface State {
   network: Network
@@ -28,6 +29,9 @@ interface State {
   balance?: bigint
   bundle?: Bundle
   bundleError?: string
+  /** The signed-in principal's applications; `undefined` while they load. */
+  applications?: Application[]
+  applicationsError?: string
   busy: boolean
   result?: DeployResult
 }
@@ -41,6 +45,8 @@ const SKELETON = `
   </header>
 
   <section class="panel" id="identity-panel"></section>
+
+  <section class="panel" id="applications-panel" hidden></section>
 
   <section class="panel">
     <div class="dropzone" id="dropzone" tabindex="0" role="button">
@@ -71,6 +77,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const state: State = { network, busy: false }
 
   const identityPanel = select<HTMLElement>(root, '#identity-panel')
+  const applicationsPanel = select<HTMLElement>(root, '#applications-panel')
   const bundlePanel = select<HTMLElement>(root, '#bundle-panel')
   const resultPanel = select<HTMLElement>(root, '#result')
   const dropzone = select<HTMLElement>(root, '#dropzone')
@@ -117,7 +124,10 @@ export function mountApp(root: HTMLElement, network: Network): void {
         state.session = undefined
         state.agent = undefined
         state.balance = undefined
+        state.applications = undefined
+        state.applicationsError = undefined
         renderIdentity()
+        renderApplications()
         renderDeployButton()
       })
     })
@@ -127,16 +137,100 @@ export function mountApp(root: HTMLElement, network: Network): void {
     state.session = session
     state.agent = await createAgent(state.network, session.identity)
     state.balance = undefined
+    state.applications = undefined
+    state.applicationsError = undefined
     renderIdentity()
+    renderApplications()
     renderDeployButton()
 
-    // Informational only — a failure here must not block deploying.
+    // Both informational — a failure here must not block deploying.
+    const agent = state.agent
+    await Promise.all([
+      cyclesBalance(agent, session.principal)
+        .catch(() => 0n)
+        .then((balance) => {
+          if (state.agent === agent) state.balance = balance
+          renderIdentity()
+        }),
+      loadApplications(agent),
+    ])
+  }
+
+  /** The signed-in principal's applications, read from the registry. */
+  async function loadApplications(agent: HttpAgent): Promise<void> {
+    const { registry } = state.network
+    if (!registry) return
     try {
-      state.balance = await cyclesBalance(state.agent, session.principal)
-    } catch {
-      state.balance = 0n
+      const applications = await createRegistry(agent, registry).list()
+      // Signing out or switching principal mid-flight makes this list somebody
+      // else's; only the agent it was read with may show it.
+      if (state.agent === agent) state.applications = applications
+    } catch (error) {
+      if (state.agent === agent) {
+        state.applicationsError = error instanceof Error ? error.message : String(error)
+      }
     }
-    renderIdentity()
+    renderApplications()
+  }
+
+  function renderApplications(): void {
+    const { session, network, applications, applicationsError } = state
+    applicationsPanel.hidden = !session
+    if (!session) {
+      applicationsPanel.innerHTML = ''
+      return
+    }
+
+    let body: string
+    if (!network.registry) {
+      body = `<p class="muted">This page was served without a registry canister, so the
+        applications deployed with it cannot be listed.</p>`
+    } else if (applicationsError) {
+      body = `<p class="error">Could not read your applications: ${escapeHtml(applicationsError)}</p>`
+    } else if (!applications) {
+      body = `<p class="muted">Loading…</p>`
+    } else if (applications.length === 0) {
+      body = `<p class="muted">No applications yet. Drop a bundle below to install one.</p>`
+    } else {
+      body = `<ul class="applications">${applications.map(renderApplication).join('')}</ul>`
+    }
+    applicationsPanel.innerHTML = `<h2>Applications</h2>${body}`
+  }
+
+  function renderApplication(application: Application): string {
+    const rows = application.canisters
+      .map(
+        (canister) => `
+        <tr>
+          <td><strong>${escapeHtml(canister.name)}</strong>${
+            canister.state === 'deployed'
+              ? ''
+              : ` <span class="badge warn">${escapeHtml(canister.state)}</span>`
+          }</td>
+          <td><code>${escapeHtml(canister.canisterId.toText())}</code></td>
+        </tr>`,
+      )
+      .join('')
+    const canisters =
+      application.canisters.length === 0
+        ? `<p class="muted">No canisters were created for this application.</p>`
+        : `<table class="canisters">
+            <thead><tr><th>Canister</th><th>Id</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`
+
+    return `
+      <li>
+        <details class="application">
+          <summary>
+            <strong>${escapeHtml(application.name)}</strong>
+            <span class="muted">last deployed ${escapeHtml(application.updated.toLocaleString())}</span>
+          </summary>
+          <p class="muted">From <code>${escapeHtml(application.bundleFileName)}</code>,
+            first deployed ${escapeHtml(application.created.toLocaleString())}.</p>
+          ${canisters}
+        </details>
+      </li>`
   }
 
   function renderBundle(): void {
@@ -349,6 +443,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   })
 
   renderIdentity()
+  renderApplications()
   renderDeployButton()
 
   void restoreSession().then(async (session) => {
