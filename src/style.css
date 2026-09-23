@@ -228,6 +228,10 @@ button.primary {
 .muted {
   color: var(--muted);
 }
+#deploy-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
 .error,
 .log li.error {
   color: var(--error);

@@ -263,6 +263,11 @@ icp cycles transfer 10t <the principal the page shows>
 Deploying with too small a balance fails before anything is created, reporting the
 shortfall.
 
+Keep the tab open while a deployment runs. Closing or reloading it kills the run mid-way,
+so the page asks the browser to confirm before letting you leave; the canisters created by
+then exist and are controlled by you, and the result lists them as unfinished if the page
+is still there to show it.
+
 Open the deployer from its canister URL rather than the Vite dev server: it learns the
 network's root key from the asset canister's `ic_env` cookie, which the dev server does not
 serve. `npm run dev` is fine for working on the page itself.

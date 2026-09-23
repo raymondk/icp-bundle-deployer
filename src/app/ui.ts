@@ -20,6 +20,7 @@ import {
 } from '../lib'
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from './auth'
 import { createAgent, describeNetwork, type Network } from './network'
+import { guardUnload } from './unload'
 
 interface State {
   network: Network
@@ -29,6 +30,8 @@ interface State {
   bundle?: Bundle
   bundleError?: string
   busy: boolean
+  /** A deployment is running: the one kind of busy that arms the leave-page warning. */
+  deploying: boolean
   result?: DeployResult
 }
 
@@ -60,6 +63,11 @@ const SKELETON = `
         subnet; its id is on the engine console's Applications page.</span>
     </label>
     <button id="deploy" class="primary" disabled>Deploy</button>
+    <p class="hint muted" id="deploy-note" hidden>
+      Keep this tab open until the deployment finishes. Closing it stops the run mid-way:
+      the canisters created so far exist and are controlled by you, and the result reports
+      them as unfinished if the page is still here to show it.
+    </p>
     <ol class="log" id="log"></ol>
     <div id="result"></div>
   </section>
@@ -68,7 +76,7 @@ const SKELETON = `
 export function mountApp(root: HTMLElement, network: Network): void {
   root.innerHTML = SKELETON
 
-  const state: State = { network, busy: false }
+  const state: State = { network, busy: false, deploying: false }
 
   const identityPanel = select<HTMLElement>(root, '#identity-panel')
   const bundlePanel = select<HTMLElement>(root, '#bundle-panel')
@@ -76,6 +84,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const dropzone = select<HTMLElement>(root, '#dropzone')
   const fileInput = select<HTMLInputElement>(root, '#file-input')
   const deployButton = select<HTMLButtonElement>(root, '#deploy')
+  const deployNote = select<HTMLParagraphElement>(root, '#deploy-note')
   const subnetInput = select<HTMLInputElement>(root, '#subnet')
   const log = select<HTMLOListElement>(root, '#log')
 
@@ -199,6 +208,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
   function renderDeployButton(): void {
     deployButton.disabled = state.busy || !state.bundle || !state.agent
     deployButton.textContent = state.busy ? 'Working…' : 'Deploy'
+    // The browser's own dialog cannot carry a message, so what a mid-run close
+    // means is said here, for as long as a close would mean it.
+    deployNote.hidden = !state.deploying
   }
 
   function renderResult(): void {
@@ -343,7 +355,19 @@ export function mountApp(root: HTMLElement, network: Network): void {
     void withBusy(async () => {
       log.replaceChildren()
       const deployer = createDeployer({ agent })
-      state.result = await deployer.deploy(bundle, { subnet, onEvent: onDeployEvent })
+      // Armed here rather than in `withBusy`, which also brackets sign-in and
+      // sign-out: only a deployment leaves something behind when interrupted.
+      state.deploying = true
+      renderDeployButton()
+      try {
+        state.result = await guardUnload(
+          window,
+          deployer.deploy(bundle, { subnet, onEvent: onDeployEvent }),
+        )
+      } finally {
+        state.deploying = false
+        renderDeployButton()
+      }
       renderResult()
     })
   })

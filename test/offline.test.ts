@@ -20,6 +20,7 @@ import {
   formatBytes,
   sha256Hex,
 } from '../src/lib'
+import { guardUnload, type UnloadTarget } from '../src/app/unload'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { createTar, gzip, type TarFile } from './support/tar'
 import { syncPlugin } from './support/plugin'
@@ -209,6 +210,47 @@ test('a disposed bundle releases the archive it held', async () => {
   // behind it does not, which is the point of disposing a large bundle.
   loaded.dispose()
   assertEqual(loaded.canisters.length, 1, 'the summary is still readable')
+})
+
+// ── Leaving the page ────────────────────────────────────────────────────────
+
+group('unload guard')
+
+/** An event target that only counts what is attached to it. */
+function fakeTarget(): UnloadTarget & { attached: number } {
+  return {
+    attached: 0,
+    addEventListener() {
+      this.attached++
+    },
+    removeEventListener() {
+      this.attached--
+    },
+  }
+}
+
+test('warns while a deployment is pending and stops once it resolves', async () => {
+  const target = fakeTarget()
+  let settle!: (value: string) => void
+  const pending = new Promise<string>((resolve) => (settle = resolve))
+
+  const guarded = guardUnload(target, pending)
+  assertEqual(target.attached, 1, 'the handler is attached as soon as the run starts')
+
+  settle('done')
+  assertEqual(await guarded, 'done', 'the guarded promise yields what the run did')
+  assertEqual(target.attached, 0, 'the handler is gone once the run settles')
+})
+
+test('stops warning when the deployment fails too', async () => {
+  const target = fakeTarget()
+  let fail!: (error: Error) => void
+  const pending = new Promise<never>((_, reject) => (fail = reject))
+
+  const guarded = guardUnload(target, pending)
+  fail(new Error('the network refused'))
+  await assertRejects(() => guarded, /network refused/, 'the failure comes through unchanged')
+  assertEqual(target.attached, 0, 'a failed run detaches the handler as a finished one does')
 })
 
 await run('offline: the library boundary')
