@@ -61,7 +61,9 @@ for (const { name, canisterId } of result.deployed) {
 
 A bundle can be a `File`, `Blob`, `Uint8Array`, `ArrayBuffer`, or an already-loaded
 `Bundle`, so the same call works from a drop zone or from a file read off disk. A
-subnet may be a `Principal` or its text form.
+subnet may be a `Principal` or its text form. A loaded `Bundle` carries its `fileName`,
+when its source had one, and the `sha256` of its bytes — the identity of what is about to be
+deployed, for whoever keeps a record of it.
 
 `deploy` never throws for an unusable bundle or a rejected canister: it returns a
 `DeployResult` carrying `deployed`, `incomplete` — created but unfinished — and
@@ -140,10 +142,25 @@ principal's list. The page finds it the same way the bundles it deploys find the
 canisters — through `PUBLIC_CANISTER_ID:registry` in the certified `ic_env` cookie the
 asset canister serves.
 
+Installing a bundle records it. The install form asks for an **application name**,
+proposed from the bundle's file name with its extension and version taken off (so
+`my-app-1.2.0.icp` proposes `my-app`) and editable; 1 to 64 printable characters. The name is
+reserved in the registry *before* anything is deployed, so a name you already have is
+refused while the bundle is still bytes in the tab, with a hint that the existing application
+can be upgraded instead. The record is then updated after every canister the run creates —
+each id reaches the registry the moment the canister exists, so a closed tab loses nothing —
+and once more when the run settles: every canister as `deployed` on success, the ones a
+partial failure left behind as `unfinished`. A run that fails before creating anything
+leaves a record with no canisters, listed like any other. The result panel names the
+application the deployment was recorded under.
+
+The record holds the name, the SHA-256 and file name of the bundle it was last deployed
+from, and for every canister its manifest name, id and state. The manifest name is the key
+the deployer injects as `PUBLIC_CANISTER_ID:<name>`, which is what an upgrade will use to
+map ids back onto the new bundle; upgrading is a follow-up.
+
 The canister builds with `mops build` through the `@dfinity/motoko` recipe, so the Motoko
-toolchain is pinned in [`mops.toml`](./mops.toml) rather than in `icp.yaml`. Its records
-are what an upgrade will be seeded from; recording an installation and upgrading one are
-follow-ups.
+toolchain is pinned in [`mops.toml`](./mops.toml) rather than in `icp.yaml`.
 
 ## Choosing a subnet
 

@@ -20,7 +20,8 @@ import {
 } from '../lib'
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from './auth'
 import { createAgent, describeNetwork, type Network } from './network'
-import { createRegistry, type Application } from './registry'
+import { deployRecorded, proposeApplicationName } from './recording'
+import { createRegistry, isValidApplicationName, RegistryError, type Application } from './registry'
 
 interface State {
   network: Network
@@ -34,6 +35,8 @@ interface State {
   applicationsError?: string
   busy: boolean
   result?: DeployResult
+  /** The application the last result was recorded under. */
+  resultApplication?: string
 }
 
 const SKELETON = `
@@ -58,6 +61,13 @@ const SKELETON = `
   </section>
 
   <section class="panel">
+    <label class="field" for="application-name">
+      <span>Application name</span>
+      <input type="text" id="application-name" spellcheck="false" autocomplete="off"
+             maxlength="64" placeholder="what to list this deployment as" />
+      <span class="hint">Proposed from the bundle's file name; 1 to 64 characters. The
+        name is how the application is listed and found again to upgrade it.</span>
+    </label>
     <label class="field" for="subnet">
       <span>Target subnet <span class="muted">— optional</span></span>
       <input type="text" id="subnet" spellcheck="false" autocomplete="off"
@@ -84,6 +94,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const fileInput = select<HTMLInputElement>(root, '#file-input')
   const deployButton = select<HTMLButtonElement>(root, '#deploy')
   const subnetInput = select<HTMLInputElement>(root, '#subnet')
+  const nameInput = select<HTMLInputElement>(root, '#application-name')
   const log = select<HTMLOListElement>(root, '#log')
 
   function renderIdentity(): void {
@@ -291,18 +302,26 @@ export function mountApp(root: HTMLElement, network: Network): void {
   }
 
   function renderDeployButton(): void {
-    deployButton.disabled = state.busy || !state.bundle || !state.agent
+    const name = nameInput.value
+    const validName = isValidApplicationName(name)
+    nameInput.classList.toggle('invalid', name !== '' && !validName)
+    deployButton.disabled = state.busy || !state.bundle || !state.agent || !validName
     deployButton.textContent = state.busy ? 'Working…' : 'Deploy'
   }
 
   function renderResult(): void {
-    const { result, network } = state
+    const { result, resultApplication, network } = state
     if (!result) {
       resultPanel.innerHTML = ''
       return
     }
 
     const sections: string[] = []
+    if (resultApplication) {
+      sections.push(
+        `<p class="loaded">Recorded as application <strong>${escapeHtml(resultApplication)}</strong>.</p>`,
+      )
+    }
     if (result.deployed.length > 0) {
       sections.push(
         `<h2>Deployed</h2><ul class="deployed">${result.deployed
@@ -360,6 +379,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     state.bundle = undefined
     state.bundleError = undefined
     state.result = undefined
+    state.resultApplication = undefined
     log.replaceChildren()
     renderResult()
 
@@ -368,6 +388,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
     } catch (error) {
       state.bundleError = error instanceof Error ? error.message : String(error)
     }
+    // The file name is the best guess at what the application is called; the
+    // user can still say otherwise.
+    nameInput.value = proposeApplicationName(state.bundle?.fileName)
     renderBundle()
     renderDeployButton()
   }
@@ -418,9 +441,24 @@ export function mountApp(root: HTMLElement, network: Network): void {
     if (file) void openBundle(file)
   })
 
+  nameInput.addEventListener('input', renderDeployButton)
+
   deployButton.addEventListener('click', () => {
-    const { bundle, agent, session } = state
+    const { bundle, agent, session, network } = state
     if (!bundle || !agent || !session) return
+
+    const name = nameInput.value
+    if (!isValidApplicationName(name)) return
+    if (!network.registry) {
+      log.replaceChildren()
+      appendLog(
+        'This page was served without a registry canister, so the deployment could not be ' +
+          'recorded as an application. Open the page through its canister URL.',
+        'error',
+      )
+      return
+    }
+    const registry = createRegistry(agent, network.registry)
 
     let subnet: Principal | undefined
     const entered = subnetInput.value.trim()
@@ -437,8 +475,44 @@ export function mountApp(root: HTMLElement, network: Network): void {
     void withBusy(async () => {
       log.replaceChildren()
       const deployer = createDeployer({ agent })
-      state.result = await deployer.deploy(bundle, { subnet, onEvent: onDeployEvent })
+
+      // The name is reserved before anything is deployed, so a clash is the
+      // first and only thing that happens; the hint says the existing
+      // application can be upgraded instead.
+      let recorded
+      try {
+        recorded = await deployRecorded({
+          registry,
+          application: { name, bundleSha256: bundle.sha256, bundleFileName: bundle.fileName ?? '' },
+          deploy: (record) =>
+            deployer.deploy(bundle, {
+              subnet,
+              onEvent: (event) => {
+                record(event)
+                onDeployEvent(event)
+              },
+            }),
+        })
+      } catch (error) {
+        if (error instanceof RegistryError) {
+          appendLog(error.message, 'error')
+          return
+        }
+        throw error
+      }
+
+      state.result = recorded.result
+      state.resultApplication = name
+      if (recorded.recordingError) {
+        appendLog(
+          `The application record could not be brought up to date: ${recorded.recordingError}`,
+          'error',
+        )
+      } else {
+        appendLog(`Recorded as application "${name}".`, 'done')
+      }
       renderResult()
+      void loadApplications(agent)
     })
   })
 
