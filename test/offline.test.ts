@@ -20,6 +20,10 @@ import {
   formatBytes,
   sha256Hex,
 } from '../src/lib'
+import { Principal } from '@icp-sdk/core/principal'
+import { deployRecorded, proposeApplicationName } from '../src/app/recording'
+import { RegistryError, type ApplicationInput, type Registry } from '../src/app/registry'
+import type { DeployEvent, DeployResult } from '../src/lib'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { createTar, gzip, type TarFile } from './support/tar'
 import { syncPlugin } from './support/plugin'
@@ -197,6 +201,140 @@ test('hashes the way icp.yaml declares digests', async () => {
     'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     'the empty digest',
   )
+})
+
+test('a loaded bundle knows the digest of its own bytes', async () => {
+  const bytes = bundle(MINIMAL)
+  const loaded = await loadBundle(bytes)
+  assertEqual(loaded.sha256, await sha256Hex(bytes), 'the bundle digest is the SHA-256 of its bytes')
+  assertEqual(loaded.sha256.length, 64, 'lowercase hex')
+})
+
+// ── Recording an installation ───────────────────────────────────────────────
+
+group('application name')
+
+test('is proposed from the file name without extension and version', () => {
+  assertEqual(proposeApplicationName('my-app-1.2.0.icp'), 'my-app', 'dotted version')
+  assertEqual(proposeApplicationName('my-app.icp'), 'my-app', 'no version')
+  assertEqual(proposeApplicationName('site_v2.tar.gz'), 'site', 'v-prefixed, double extension')
+  assertEqual(proposeApplicationName('my-app-1.2.0-beta.1.icp'), 'my-app', 'pre-release tail')
+  assertEqual(proposeApplicationName('My App.tgz'), 'My App', 'spaces inside are fine')
+})
+
+test('is empty when the source has no usable name', () => {
+  assertEqual(proposeApplicationName(undefined), '', 'no file name')
+  assertEqual(proposeApplicationName('1.2.0.icp'), '', 'nothing but a version')
+  assertEqual(proposeApplicationName('.icp'), '', 'nothing but an extension')
+})
+
+group('recording')
+
+const alpha = Principal.fromText('rrkah-fqaaa-aaaaa-aaaaq-cai')
+const beta = Principal.fromText('ryjl3-tyaaa-aaaaa-aaaba-cai')
+
+/** A registry that remembers every write, in order. */
+function fakeRegistry(options: { failUpdates?: boolean; taken?: boolean } = {}) {
+  const writes: { method: 'create' | 'update'; input: ApplicationInput }[] = []
+  const stamp = (input: ApplicationInput) => ({ ...input, created: new Date(0), updated: new Date(1) })
+  const registry: Registry = {
+    list: async () => [],
+    get: async () => undefined,
+    async create(input) {
+      if (options.taken) throw new RegistryError({ kind: 'alreadyExists', name: input.name })
+      writes.push({ method: 'create', input })
+      return stamp(input)
+    },
+    async update(input) {
+      if (options.failUpdates) throw new Error('the registry is unreachable')
+      writes.push({ method: 'update', input })
+      return stamp(input)
+    },
+  }
+  return { registry, writes }
+}
+
+const application = { name: 'shop', bundleSha256: 'ab'.repeat(32), bundleFileName: 'shop-1.0.0.icp' }
+
+/** A deployment that creates two canisters, then finishes as `result` says. */
+function fakeDeploy(result: DeployResult) {
+  return async (record: (event: DeployEvent) => void): Promise<DeployResult> => {
+    record({ type: 'phase', message: 'Creating canisters' })
+    record({ type: 'started', name: 'backend' })
+    record({ type: 'created', name: 'backend', canisterId: alpha })
+    record({ type: 'created', name: 'frontend', canisterId: beta })
+    record({ type: 'installed', name: 'backend', canisterId: alpha })
+    return result
+  }
+}
+
+test('reserves the name before deploying, records each canister as it exists, then the final states', async () => {
+  const { registry, writes } = fakeRegistry()
+  let deployStarted = false
+  const recorded = await deployRecorded({
+    registry,
+    application,
+    deploy: (record) => {
+      assertEqual(writes[0]?.method, 'create', 'the name is reserved before the run starts')
+      assertEqual(writes[0]?.input.canisters.length, 0, 'with no canisters yet')
+      deployStarted = true
+      return fakeDeploy({
+        deployed: [{ name: 'backend', canisterId: alpha }],
+        incomplete: [{ name: 'frontend', canisterId: beta }],
+        error: 'frontend failed to sync',
+      })(record)
+    },
+  })
+  assert(deployStarted, 'the deployment ran')
+
+  const updates = writes.filter((write) => write.method === 'update').map((write) => write.input.canisters)
+  assertEqual(updates.length, 3, 'one update per created canister, one when the run settles')
+  assertEqual(updates[0]!.map((c) => `${c.name}:${c.state}`).join(','), 'backend:unfinished', 'first id lands at once')
+  assertEqual(
+    updates[1]!.map((c) => `${c.name}:${c.state}`).join(','),
+    'backend:unfinished,frontend:unfinished',
+    'second id lands at once',
+  )
+  assertEqual(
+    updates[2]!.map((c) => `${c.name}:${c.state}`).join(','),
+    'backend:deployed,frontend:unfinished',
+    'the final update carries the result states',
+  )
+  assertEqual(updates[2]![0]!.canisterId.toText(), alpha.toText(), 'ids are kept')
+  assertEqual(recorded.result.error, 'frontend failed to sync', 'the result comes back as it was')
+  assertEqual(recorded.recordingError, undefined, 'nothing went wrong recording')
+  assert(recorded.application, 'the record as the registry last acknowledged it')
+})
+
+test('a taken name is refused before anything is deployed', async () => {
+  const { registry } = fakeRegistry({ taken: true })
+  let deployed = false
+  await assertRejects(
+    () =>
+      deployRecorded({
+        registry,
+        application,
+        deploy: async () => {
+          deployed = true
+          return { deployed: [], incomplete: [] }
+        },
+      }),
+    /already have an application named "shop".*[Uu]pgrade/,
+    'the clash names the application and hints at upgrading',
+  )
+  assert(!deployed, 'the deployment never started')
+})
+
+test('a record that cannot be updated is reported, not thrown', async () => {
+  const { registry } = fakeRegistry({ failUpdates: true })
+  const recorded = await deployRecorded({
+    registry,
+    application,
+    deploy: fakeDeploy({ deployed: [{ name: 'backend', canisterId: alpha }, { name: 'frontend', canisterId: beta }], incomplete: [] }),
+  })
+  assertEqual(recorded.result.deployed.length, 2, 'the deployment result is intact')
+  assert(recorded.recordingError?.includes('unreachable'), 'and the recording failure is on it')
+  assertEqual(recorded.application, undefined, 'nothing was acknowledged')
 })
 
 // ── Disposal ────────────────────────────────────────────────────────────────

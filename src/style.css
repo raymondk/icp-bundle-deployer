@@ -185,6 +185,9 @@ button.primary {
   border: 1px solid var(--border);
   border-radius: 8px;
 }
+.field input.invalid {
+  border-color: var(--error);
+}
 .field input:focus {
   outline: none;
   border-color: var(--accent);

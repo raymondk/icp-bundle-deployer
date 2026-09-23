@@ -8,7 +8,7 @@
  */
 
 import { initialize } from './init'
-import { loadBundle as loadCore, type Bundle as CoreBundle } from './wasm/deployer'
+import { loadBundle as loadCore, sha256Hex, type Bundle as CoreBundle } from './wasm/deployer'
 
 /** Anything a bundle's bytes can arrive as. */
 export type BundleSource = Bundle | File | Blob | Uint8Array | ArrayBuffer
@@ -42,12 +42,18 @@ export class IntegrityError extends BundleError {}
  */
 export class Bundle {
   readonly fileName?: string
+  /**
+   * The SHA-256 of the bundle's bytes as they were handed over, lowercase hex:
+   * the identity of what was deployed, for recording alongside the result.
+   */
+  readonly sha256: string
   readonly canisters: readonly BundleCanister[]
   readonly #core: CoreBundle
 
   /** @internal Bundles come from {@link loadBundle}. */
-  constructor(core: CoreBundle, fileName?: string) {
+  constructor(core: CoreBundle, sha256: string, fileName?: string) {
     this.#core = core
+    this.sha256 = sha256
     this.fileName = fileName
     this.canisters = core.canisters as BundleCanister[]
   }
@@ -77,7 +83,8 @@ export async function loadBundle(source: BundleSource): Promise<Bundle> {
   await initialize()
 
   try {
-    return new Bundle(await loadCore(await bytesOf(source)), nameOf(source))
+    const bytes = await bytesOf(source)
+    return new Bundle(await loadCore(bytes), sha256Hex(bytes), nameOf(source))
   } catch (error) {
     throw refusal(error)
   }
