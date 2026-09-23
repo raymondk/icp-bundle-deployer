@@ -96,46 +96,59 @@ await initialize(await readFile('src/lib/wasm/deployer_bg.wasm'))
    well-known address it has on mainnet. One path on every network, so a local deployment
    exercises exactly what mainnet will do.
 4. **Injects the canister IDs** — see below.
-5. **Installs each wasm** — in one `install_code` call, or through the chunk store for wasms
-   above the ingress limit.
-6. **Runs the bundle's sync plugin** — see below. Assets are uploaded by the same wasm
+5. **Applies the manifest's settings** — controllers included. Whoever the manifest names is
+   *added* to the canister's current controllers rather than replacing them, and nothing is
+   ever removed, so the identity that paid for a canister never loses access to it — the
+   same thing `icp deploy` leaves behind.
+6. **Installs each wasm** — in one `install_code` call, or through the chunk store for wasms
+   above the ingress limit. The mode is read off the canister: install when it is empty,
+   upgrade when a module is already there.
+7. **Runs the bundle's sync plugin** — see below. Assets are uploaded by the same wasm
    `icp sync` runs.
-7. **Hands over control** — controllers are applied last, so the deployer keeps control of
-   each canister while it is still setting it up. Whoever the manifest names is *added* to
-   the controllers rather than replacing them, so the identity that paid for a canister
-   never loses access to it — the same thing `icp deploy` leaves behind.
 
 Those are phases, not a per-canister loop, and the order matters: every canister is created
 before any wasm is installed, and every wasm is installed before any sync runs. The second
 separation is there because a sync plugin may call the canisters its step lists, and one
-that ran between installs would be calling a canister with nothing in it yet. `icp deploy`
-runs the same phases in the same order. The deployer currently drives them itself, out of
-`icp-project`'s individual operations, for historical reasons: it was written against a
-branch whose deploy was shaped around a project on disk. Switching to `icp-project`'s own
-`deploy` operation is tracked in
-[#7](https://github.com/raymondk/icp-bundle-deployer/issues/7). If a phase fails the run
-stops and the page reports which canisters exist but are unfinished, so nothing is silently
-abandoned — they exist and you control them.
+that ran between installs would be calling a canister with nothing in it yet. They are
+`icp deploy`'s own phases, because they are run by `icp-project`'s own `deploy` operation —
+the same code, not a copy of its order. The deployer supplies what that operation needs
+from its surroundings: the bundle as a filesystem, the ids of this run in a store that
+lives as long as the run, the browser's agent as the way to call canisters, jco as the
+plugin runtime. The operation decides everything else, including which canisters to create
+at all — one whose id is already in the store is left alone and upgraded, which is what an
+application upgrade will build on. If a phase fails the run stops and the page reports
+which canisters exist but are unfinished, so nothing is silently abandoned — they exist and
+you control them.
+
+One thing that operation does not have in a browser is a clock: it waits a moment after
+starting a canister before its sync plugin's first query, and it reaches the clock through
+tokio's timers, which have nothing to run on in wasm. Until that wait goes through a seam
+upstream, the core builds against a branch of a fork that is upstream plus that one change
+([`Cargo.toml`](./src/lib/core/Cargo.toml) says which).
 
 ## Choosing a subnet
 
 A deployment lands on exactly one subnet, resolved once before anything is created, so
 canisters that call each other are never scattered. The optional **target subnet** field
-names it — the equivalent of `icp deploy --subnet`. Left empty, the cycles minting
-canister's default subnets decide, as in icp-cli; on a network with no minting canister
-the run anchors to wherever its first canister lands and keeps the rest with it.
+names it — the equivalent of `icp deploy --subnet`. Left empty, the resolution is icp-cli's:
+a canister that already exists decides, and new ones are placed beside it; otherwise one of
+the cycles minting canister's default subnets is picked.
 
 ## Cloud engines
 
 A **cloud engine** is a user-owned subnet, and it does not create canisters through the
 cycles ledger — creation is delegated to the subnet's **engine operator**, which the
 engine's administrators authorize callers against. Name the engine's subnet (its id is on
-the console's Applications page) and the deployer follows the same route icp-cli does:
+the console's Applications page) and it is icp-cli's own create operation that takes the
+engine route:
 
-- ask the engine registry (`q6cfj-fyaaa-aaaar-qb77q-cai`) which operator serves that
-  subnet;
-- if one answers, address `create_canister` to the operator instead of the ledger — the
-  two are byte-compatible, so nothing else changes;
+- the deployer is asked whether the subnet is an engine. icp-cli reads the subnet's type
+  off the network's registry, which a browser agent cannot; the deployer asks the engine
+  registry (`q6cfj-fyaaa-aaaar-qb77q-cai`) instead, and an operator registered for the
+  subnet is what makes it an engine;
+- if it is, the operation asks the same registry which operator and addresses
+  `create_canister` to it instead of the ledger — the two are byte-compatible, so nothing
+  else changes;
 - if the registry is absent or has no operator for the subnet, it is an ordinary subnet
   and creation goes through the ledger as usual.
 
@@ -270,7 +283,9 @@ referenced by URL, a tampered digest — because those decide whether a deployme
 at all, and the point is that a bad bundle is rejected before any canister exists. Those
 cases live in `src/lib/core`, which `npm test` runs with `cargo test` before the
 TypeScript suite checks that a refusal reaches a caller as the error class it can branch
-on.
+on. The core also drives the deploy operation against a stand-in network there, to check
+the one thing this deployer adds around it: a canister whose id is already in the store is
+not created again and is installed in the mode its status calls for.
 
 The e2e suite needs a running local network (`icp network start -d`). It builds a
 two-canister bundle from the published certified-assets release (cached under
@@ -286,10 +301,10 @@ IDs in the `ic_env` cookie, and the synced site's redirects, clean URLs and 404.
 | `src/lib/index.ts` | the library's public API — everything below is reached through it |
 | `src/lib/deployer.ts` | `createDeployer`: binds an agent, resolves what the caller left out |
 | `src/lib/bundle.ts` | loading a bundle, and the errors a bad one raises |
-| `src/lib/host.ts` | what the core calls out to: agent-js, canister creation, plugins |
-| `src/lib/ic/` | canister creation, placement, metadata and settings reads and writes |
+| `src/lib/host.ts` | what the core calls out to: agent-js, plugins |
+| `src/lib/ic/` | the cycles balance, subnet lookups, metadata and settings reads for plugins |
 | `src/lib/plugin/` | plugin transpilation, the WASI sandbox, the plugin's canister imports |
-| `src/lib/core/` | the Rust core: the archive, the manifest, phased orchestration |
+| `src/lib/core/` | the Rust core: the archive, the manifest, the seams the deploy operation runs against |
 | `src/lib/wasm/` | the compiled core, generated by `npm run build:lib` |
 | `src/app/` | the page: network detection, Internet Identity, UI |
 | `test/` | the offline and e2e suites |

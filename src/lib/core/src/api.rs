@@ -7,6 +7,7 @@
 use std::{rc::Rc, sync::Arc};
 
 use candid::Principal;
+use icp_project::{canister::sync::Syncer, store_id::IdMapping};
 use js_sys::{Function, Promise};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -14,9 +15,13 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::{
     bundle::{self, BundleErrorKind, LoadedBundle},
-    deploy,
-    events::{Emitter, to_js},
+    deploy::{self, Options, Runtime},
+    events::{DeployResult, Emitter, to_js},
     host::{DeployerHost, Host},
+    plugin::JsPluginRunner,
+    progress::Sink,
+    runtime::{JsRandom, JsTimer},
+    seams::{BundleWasm, NoScripts},
 };
 
 #[wasm_bindgen(start)]
@@ -98,7 +103,8 @@ pub async fn load_bundle(data: Vec<u8>) -> Result<Bundle, JsValue> {
 ///
 /// `environment` names the environment the manifest is read for — `ic` or
 /// `local` — which decides which overrides apply and what a sync plugin is told
-/// it is running against.
+/// it is running against. `subnet`, when given, is where every canister is
+/// created; `cycles` is what each is funded with, as a decimal string.
 ///
 /// Resolves rather than rejecting when a deployment fails part-way: the result
 /// carries what was deployed, what was created but left unfinished, and why it
@@ -109,13 +115,21 @@ pub fn deploy_bundle(
     host: DeployerHost,
     caller: String,
     environment: String,
+    subnet: Option<String>,
+    cycles: String,
     on_event: Function,
 ) -> Result<Promise, JsValue> {
-    let caller = Principal::from_text(&caller).map_err(|e| {
-        JsValue::from(js_sys::Error::new(&format!(
-            "'{caller}' is not a principal: {e}"
-        )))
-    })?;
+    let caller = Principal::from_text(&caller)
+        .map_err(|e| invalid(format!("'{caller}' is not a principal: {e}")))?;
+    let subnet = subnet
+        .map(|subnet| {
+            Principal::from_text(&subnet)
+                .map_err(|e| invalid(format!("'{subnet}' is not a subnet id: {e}")))
+        })
+        .transpose()?;
+    let cycles: u128 = cycles
+        .parse()
+        .map_err(|e| invalid(format!("'{cycles}' is not a number of cycles: {e}")))?;
     let bundle = Rc::clone(&bundle.inner);
 
     // A borrow cannot outlive an exported function, so the deployment is handed
@@ -125,7 +139,37 @@ pub fn deploy_bundle(
         // the host is what implements them.
         let host = Arc::new(Host::new(host, caller));
         let emitter = Emitter::new(on_event);
-        let result = deploy::deploy(&bundle, &host, &environment, &emitter).await;
+        let sink: Sink = Arc::new(move |event| emitter.emit(event));
+
+        // Asked for up front: a sync plugin is told where the network is, and a
+        // host that cannot say so should fail the run before it has created
+        // anything.
+        let network = match host.network() {
+            Ok(network) => network,
+            Err(message) => return to_js(&DeployResult::failed(message)).map_err(JsValue::from),
+        };
+
+        // The crate's own syncer, with the browser behind each of its seams: no
+        // scripts, wasms out of the bundle, plugins through jco.
+        let files = bundle.files.clone();
+        let runtime = Runtime {
+            syncer: Arc::new(Syncer::new(
+                Arc::new(NoScripts),
+                Arc::new(BundleWasm(files.clone())),
+                Arc::new(JsPluginRunner::new(Arc::clone(&host), files)),
+            )),
+            random: Arc::new(JsRandom),
+            timer: Arc::new(JsTimer),
+        };
+        let options = Options {
+            environment,
+            subnet,
+            cycles,
+            existing: IdMapping::new(),
+            network,
+        };
+
+        let result = deploy::deploy(&bundle, host, runtime, options, sink).await;
         to_js(&result).map_err(JsValue::from)
     }))
 }
@@ -135,6 +179,11 @@ pub fn deploy_bundle(
 #[wasm_bindgen(js_name = sha256Hex)]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     bundle::sha256_hex(bytes)
+}
+
+/// An argument the library should never have passed.
+fn invalid(message: String) -> JsValue {
+    JsValue::from(js_sys::Error::new(&message))
 }
 
 /// A refused bundle, as an `Error` carrying which of the three checks refused

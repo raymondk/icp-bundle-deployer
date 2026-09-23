@@ -1,16 +1,19 @@
 //! The page's side of a deployment.
 //!
 //! Three things cannot be done from inside this module: signing and sending
-//! calls to a replica, creating a canister, and running a sync plugin. They are
-//! supplied by the host as a single JavaScript object — the calls backed by
-//! agent-js, creation by the cycles ledger client, plugins by jco — and
-//! everything else (what to call, in what order, with which arguments) is
-//! decided here and in `icp-project`. The host also says where the network is,
-//! which nothing here needs but a sync plugin is told.
+//! calls to a replica, reading a certified fact about a canister, and running a
+//! sync plugin. They are supplied by the host as a single JavaScript object —
+//! the calls backed by agent-js, plugins by jco — and everything else (what to
+//! call, in what order, with which arguments) is decided in `icp-project`. The
+//! host also says where the network is, which nothing here needs but a sync
+//! plugin is told.
 //!
 //! `icp-project` reaches canisters through its [`CanisterCalls`] seam, and this
 //! is the browser's implementation of it: every call becomes an ingress message
-//! signed by whichever agent backs the host.
+//! signed by whichever agent backs the host. Creating a canister is one of those
+//! calls — to the cycles ledger, or to a cloud engine's operator — made by the
+//! crate's own create operation, so where a canister lands is decided where
+//! `icp deploy` decides it.
 
 use std::{
     future::Future,
@@ -19,9 +22,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use candid::Principal;
+use candid::{Decode, Encode, Principal};
+use icp_canister_interfaces::engine_canister::{
+    ENGINE_CANISTER_CID, GET_ENGINE_OPERATOR_BY_SUBNET_METHOD, GetEngineOperatorBySubnetArgs,
+    GetEngineOperatorBySubnetResult,
+};
 use icp_project::{
     calls::{Authority, Call, CallError, CanisterCalls, RouteTo},
+    error::flatten,
     network::NetworkUrls,
 };
 use js_sys::{Promise, Reflect, Uint8Array};
@@ -70,6 +78,19 @@ export interface NetworkUrls {
   apiUrl: string
   /** The HTTP gateway canisters are served through, when the network has one. */
   gatewayUrl?: string
+}
+
+/**
+ * A call the replica answered with a rejection, as opposed to one that never
+ * got an answer. The deployment branches on rejections — a canister reported
+ * as not found, or as stopped — so a host that can tell them apart says so by
+ * rejecting `update` with an `Error` carrying one of these as `reject`.
+ */
+export interface CallRejection {
+  /** The replica's error code, such as `IC0301`, when it gave one. */
+  code?: string
+  /** The reject message, as the replica wrote it. */
+  message: string
 }
 
 /** A fully-resolved sync-plugin step, ready for the jco adapter to run. */
@@ -124,7 +145,11 @@ export interface PluginRequest {
  * talks to are both decided there.
  */
 export interface DeployerHost {
-  /** Raw update call. `cycles` is a decimal string, since a u128 is not a JS number. */
+  /**
+   * Raw update call. `cycles` is a decimal string, since a u128 is not a JS
+   * number. A replica rejection should reject with an `Error` whose `reject`
+   * is a `CallRejection`; anything else is a call that got no answer.
+   */
   update(
     canisterId: string,
     method: string,
@@ -135,12 +160,11 @@ export interface DeployerHost {
   /** A canister's custom-section metadata, or `undefined` when it has none. */
   readCanisterMetadata(canisterId: string, path: string): Promise<Uint8Array | undefined>
   /**
-   * Creates one empty canister and returns its id. Where it lands — the subnet,
-   * and whether a cloud engine's operator creates it — is the host's decision;
-   * the deployment only asks for canisters, one per canister the manifest
-   * declares, in declaration order.
+   * Which subnet a canister lives on. Asked once per deployment at most, and
+   * only when a canister already exists: the new ones are then placed beside
+   * it, as `icp deploy` places them.
    */
-  createCanister(): Promise<string>
+  subnetOf(canisterId: string): Promise<string>
   /** Runs one sync plugin to completion. */
   runPlugin(request: PluginRequest): Promise<void>
   /**
@@ -174,8 +198,8 @@ extern "C" {
         path: &str,
     ) -> Result<Promise, JsValue>;
 
-    #[wasm_bindgen(method, catch, js_name = createCanister)]
-    fn create_canister(this: &DeployerHost) -> Result<Promise, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = subnetOf)]
+    fn subnet_of(this: &DeployerHost, canister_id: &str) -> Result<Promise, JsValue>;
 
     #[wasm_bindgen(method, catch, js_name = runPlugin)]
     fn run_plugin(this: &DeployerHost, request: &JsValue) -> Result<Promise, JsValue>;
@@ -184,10 +208,12 @@ extern "C" {
     fn network(this: &DeployerHost) -> Result<JsValue, JsValue>;
 }
 
-/// The host, plus the principal it signs as.
+/// The host, plus the principal it signs as and the registry it asks about
+/// cloud engines.
 pub struct Host {
     js: DeployerHost,
     caller: Principal,
+    engine_registry: Principal,
 }
 
 // The generated module is single-threaded, so the JavaScript handles held here
@@ -197,15 +223,26 @@ pub struct Host {
 unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
+/// Why a call the host made did not produce a reply, as far as the host could
+/// tell.
+pub enum CallFailure {
+    /// The replica answered, and the answer was no.
+    Rejected {
+        code: Option<String>,
+        message: String,
+    },
+    /// Anything else: the call never got an answer, or the host itself failed.
+    Other(String),
+}
+
 impl Host {
     pub fn new(js: DeployerHost, caller: Principal) -> Self {
-        Self { js, caller }
-    }
-
-    /// The principal every call is signed as, and therefore the controller of
-    /// every canister this deployment creates.
-    pub fn caller(&self) -> Principal {
-        self.caller
+        Self {
+            js,
+            caller,
+            engine_registry: Principal::from_text(ENGINE_CANISTER_CID)
+                .expect("the engine registry's id is a principal"),
+        }
     }
 
     pub async fn update_call(
@@ -215,7 +252,7 @@ impl Host {
         arg: Vec<u8>,
         effective_canister_id: Principal,
         cycles: u128,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, CallFailure> {
         let promise = self
             .js
             .update(
@@ -225,8 +262,9 @@ impl Host {
                 &effective_canister_id.to_text(),
                 &cycles.to_string(),
             )
-            .map_err(|e| describe(&e))?;
-        bytes(await_js(promise).await?)
+            .map_err(|e| failure(&e))?;
+        let value = JsFuture::from(promise).await.map_err(|e| failure(&e))?;
+        bytes(value).map_err(CallFailure::Other)
     }
 
     pub async fn metadata(
@@ -245,14 +283,17 @@ impl Host {
         bytes(value).map(Some)
     }
 
-    pub async fn create_canister(&self) -> Result<Principal, String> {
-        let promise = self.js.create_canister().map_err(|e| describe(&e))?;
+    pub async fn subnet(&self, canister: Principal) -> Result<Principal, String> {
+        let promise = self
+            .js
+            .subnet_of(&canister.to_text())
+            .map_err(|e| describe(&e))?;
         let value = await_js(promise).await?;
         let text = value
             .as_string()
-            .ok_or_else(|| "the host returned something other than a canister id".to_owned())?;
+            .ok_or_else(|| "the host returned something other than a subnet id".to_owned())?;
         Principal::from_text(&text)
-            .map_err(|e| format!("the host returned '{text}', which is not a canister id: {e}"))
+            .map_err(|e| format!("the host returned '{text}', which is not a subnet id: {e}"))
     }
 
     pub async fn run_plugin(&self, request: &JsValue) -> Result<(), String> {
@@ -319,7 +360,17 @@ impl CanisterCalls for Host {
         };
         assume_send(self.update_call(canister, &method, arg, effective, cycles))
             .await
-            .map_err(|message| CallError::failed(canister, &method, HostError { message }))
+            .map_err(|failure| match failure {
+                CallFailure::Rejected { code, message } => CallError::Rejected {
+                    canister,
+                    method: method.clone(),
+                    code,
+                    message,
+                },
+                CallFailure::Other(message) => {
+                    CallError::failed(canister, &method, HostError { message })
+                }
+            })
     }
 
     /// An update call reaches a query method just as well, and the reply is the
@@ -362,24 +413,52 @@ impl CanisterCalls for Host {
     }
 
     async fn subnet_of(&self, canister: Principal) -> Result<Principal, CallError> {
-        Err(CallError::failed(
-            canister,
-            "read_state",
-            Unsupported {
-                what: "look up a canister's subnet",
-            },
-        ))
+        assume_send(self.subnet(canister))
+            .await
+            .map_err(|message| CallError::failed(canister, "read_state", HostError { message }))
     }
 
+    /// Whether `subnet` is a cloud engine, which creates canisters through its
+    /// operator rather than through the cycles ledger.
+    ///
+    /// icp-cli reads the subnet's type off the network's registry. A browser
+    /// agent cannot, so the engine registry's answer is the test: an operator
+    /// registered for the subnet makes it an engine, and the crate's create
+    /// operation then asks the same registry which operator. A registry that is
+    /// not deployed on this network — every local network — means no engine,
+    /// exactly as a registry with no operator for the subnet does.
     async fn subnet_uses_engine_operator(&self, subnet: Principal) -> Result<bool, CallError> {
-        Err(CallError::failed(
-            subnet,
-            "read_state",
-            Unsupported {
-                what: "consult the engine registry",
-            },
-        ))
+        let method = GET_ENGINE_OPERATOR_BY_SUBNET_METHOD;
+        let arg = Encode!(&GetEngineOperatorBySubnetArgs {
+            subnet_id: Some(subnet),
+        })
+        .map_err(|e| CallError::failed(self.engine_registry, method, e))?;
+
+        match self
+            .query(Call::new(self.engine_registry, method, arg))
+            .await
+        {
+            Ok(reply) => {
+                let result = Decode!(&reply, GetEngineOperatorBySubnetResult)
+                    .map_err(|e| CallError::failed(self.engine_registry, method, e))?;
+                Ok(result.engine_operator_id.is_some())
+            }
+            Err(error) if is_canister_not_found(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
+}
+
+/// Whether a call failed because the canister it was addressed to does not
+/// exist on this network: the replica's `IC0301`, or — from a host that gave no
+/// code, or a gateway that answered before any replica did — a message saying
+/// so.
+fn is_canister_not_found(error: &CallError) -> bool {
+    if error.code() == Some("IC0301") {
+        return true;
+    }
+    let text = flatten(error).to_ascii_lowercase();
+    text.contains("canister") && text.contains("not found")
 }
 
 /// A future the single-threaded module may treat as `Send`.
@@ -428,6 +507,20 @@ fn string_property(object: &JsValue, key: &str) -> Result<Option<String>, String
         .as_string()
         .map(Some)
         .ok_or_else(|| format!("the host's '{key}' is not a string"))
+}
+
+/// What a rejected `update` means: a replica's rejection when the host tagged
+/// the error with one (see `CallRejection` in the host's interface), otherwise
+/// whatever the host said.
+fn failure(value: &JsValue) -> CallFailure {
+    if let Ok(reject) = Reflect::get(value, &JsValue::from_str("reject"))
+        && reject.is_object()
+        && let Ok(Some(message)) = string_property(&reject, "message")
+    {
+        let code = string_property(&reject, "code").ok().flatten();
+        return CallFailure::Rejected { code, message };
+    }
+    CallFailure::Other(describe(value))
 }
 
 /// A JavaScript rejection, as a message worth showing. An `Error` carries the

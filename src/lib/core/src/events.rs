@@ -1,90 +1,105 @@
-//! Progress, as it happens.
+//! Progress, as it happens, and the result at the end.
 //!
 //! A deployment is a sequence of calls that can each take seconds, so the caller
-//! is told what is happening while it happens rather than at the end. Events are
-//! plain JavaScript objects; the library around this module turns them into
-//! whatever the page shows.
+//! is told what is happening while it happens rather than at the end. The core
+//! reports on the deploy operation's own event stream (see [`crate::progress`]);
+//! what leaves this module is the smaller vocabulary the library around it
+//! shows, as plain JavaScript objects.
 
-use js_sys::Function;
 use serde::Serialize;
-use wasm_bindgen::prelude::*;
 
-/// What the core reports as it goes. The library around it adds events of its
-/// own — canister placement, which it decides — so this is a subset of the
-/// `DeployEvent` a caller sees.
-#[derive(Debug, Serialize)]
+/// What a deployment reports as it goes. This is the whole `DeployEvent` a
+/// caller of the library sees; the library adds nothing of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
 pub enum DeployEvent {
+    /// Something that concerns the whole deployment: a phase beginning, or a
+    /// notice about the run as a whole.
+    Phase { message: String },
+    /// A canister is about to be created.
     Started { name: String },
+    /// A canister exists. Reported the moment its id is known, so a caller that
+    /// records ids loses nothing if the run is cut short after this.
     Created { name: String, canister_id: String },
+    /// A line about one canister: what is being done to it, or what its sync
+    /// plugin printed.
     Progress { name: String, message: String },
+    /// A canister's wasm is installed and running.
     Installed { name: String, canister_id: String },
+    /// Something about one canister failed. The run stops after the phase it
+    /// was in; the result says what that left behind.
     Failed { name: String, message: String },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployedCanister {
     pub name: String,
     pub canister_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DeployResult {
+    /// Canisters that are fully deployed, in the order the environment declares
+    /// them.
     pub deployed: Vec<DeployedCanister>,
+    /// Canisters this run created but did not finish. They exist and the
+    /// caller controls them, so they are reported rather than lost.
     pub incomplete: Vec<DeployedCanister>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Where events go. Cloneable so a sync step can keep one for its own output.
-#[derive(Clone)]
-pub struct Emitter(Function);
-
-// Single-threaded by construction; see the note on `Host`.
-unsafe impl Send for Emitter {}
-unsafe impl Sync for Emitter {}
-
-impl Emitter {
-    pub fn new(callback: Function) -> Self {
-        Self(callback)
-    }
-
-    /// Reporting progress is never worth failing a deployment over, so a
-    /// callback that throws is ignored.
-    pub fn emit(&self, event: DeployEvent) {
-        if let Ok(value) = to_js(&event) {
-            let _ = self.0.call1(&JsValue::NULL, &value);
+impl DeployResult {
+    /// A run that stopped before it created anything.
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Self::default()
         }
     }
 }
 
-/// Serialize to plain JavaScript objects rather than `Map`s, which is what the
-/// library around this module expects to receive.
-pub fn to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
-    value.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-}
+#[cfg(target_family = "wasm")]
+pub use js::{Emitter, to_js};
 
-/// An emitter bound to one canister, for the lines its sync plugin prints.
-#[derive(Clone)]
-pub struct ProgressSink {
-    emitter: Emitter,
-    canister: String,
-}
+#[cfg(target_family = "wasm")]
+mod js {
+    use js_sys::Function;
+    use serde::Serialize;
+    use wasm_bindgen::prelude::*;
 
-impl ProgressSink {
-    pub fn new(emitter: Emitter, canister: String) -> Self {
-        Self { emitter, canister }
+    use super::DeployEvent;
+
+    /// Where events go: the callback the library passed in.
+    #[derive(Clone)]
+    pub struct Emitter(Function);
+
+    // Single-threaded by construction; see the note on `Host`.
+    unsafe impl Send for Emitter {}
+    unsafe impl Sync for Emitter {}
+
+    impl Emitter {
+        pub fn new(callback: Function) -> Self {
+            Self(callback)
+        }
+
+        /// Reporting progress is never worth failing a deployment over, so a
+        /// callback that throws is ignored.
+        pub fn emit(&self, event: DeployEvent) {
+            if let Ok(value) = to_js(&event) {
+                let _ = self.0.call1(&JsValue::NULL, &value);
+            }
+        }
     }
 
-    pub fn line(&self, message: String) {
-        self.emitter.emit(DeployEvent::Progress {
-            name: self.canister.clone(),
-            message,
-        });
+    /// Serialize to plain JavaScript objects rather than `Map`s, which is what
+    /// the library around this module expects to receive.
+    pub fn to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
+        value.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
     }
 }

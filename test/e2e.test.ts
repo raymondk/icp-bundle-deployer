@@ -14,13 +14,12 @@ import { HttpAgent } from '@icp-sdk/core/agent'
 import {
   createDeployer,
   cyclesBalance,
-  resolveEngineOperator,
   resolveSubnet,
   subnetOf,
   type DeployedCanister,
 } from '../src/lib'
 import { fullstackBundle } from './support/fixtures'
-import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
+import { assert, assertEqual, group, run, test } from './support/harness'
 import { canisterStatus } from './support/status'
 import { loadModule } from './support/wasm'
 
@@ -42,12 +41,15 @@ const deployer = createDeployer({ agent, gatewayUrl: HOST })
 const fixture = await fullstackBundle()
 const bundle = await deployer.load(new File([fixture.bytes as BlobPart], 'e2e.icp'))
 
-// What the script plugin printed while it ran, as the deployment reported it.
+// What the script plugin printed while it ran, as the deployment reported it,
+// and the phases the run went through.
 const scriptOutput: string[] = []
+const phases: string[] = []
 
 const result = await deployer.deploy(bundle, {
   onEvent: (event) => {
     if (event.type === 'failed') console.log(`    ! ${event.message}`)
+    if (event.type === 'phase') phases.push(event.message)
     if (event.type === 'progress' && event.name === 'plain') scriptOutput.push(event.message)
   },
 })
@@ -64,6 +66,20 @@ test('deploys every canister in the bundle', () => {
   assertEqual(result.error, undefined, `deployment failed: ${result.error}`)
   assertEqual(result.deployed.length, 2, 'both canisters deployed')
   assertEqual(result.incomplete.length, 0, 'nothing left incomplete')
+})
+
+// The phases are `icp deploy`'s own, reported as the run enters them — the
+// same operation, so the same order: every canister created before any wasm is
+// installed, and every wasm installed before any sync plugin runs.
+test('runs the phases icp deploy runs, in its order', () => {
+  const expected = [
+    'Creating canisters',
+    'Setting environment variables',
+    'Applying canister settings',
+    'Installing canisters',
+    'Syncing canisters',
+  ]
+  assertEqual(phases.join(' > '), expected.join(' > '), 'phases in order')
 })
 
 test('installs the wasm the manifest declared', async () => {
@@ -109,25 +125,6 @@ test('resolves a default subnet from the minting canister', async () => {
 test('honours an explicitly named subnet', async () => {
   const subnet = (await resolveSubnet(agent))!
   assertEqual((await resolveSubnet(agent, subnet))?.toText(), subnet.toText(), 'explicit wins')
-})
-
-group('cloud engine')
-
-test('reads a missing engine registry as "no operator"', async () => {
-  const subnet = (await resolveSubnet(agent))!
-  const operator = await resolveEngineOperator(agent, subnet)
-  assertEqual(operator, undefined, 'no engine is deployed locally')
-})
-
-test('reports a registry that answers with something else', async () => {
-  const subnet = (await resolveSubnet(agent))!
-  // The cycles ledger exists but has no such method: that is an error worth
-  // surfacing, not a silent "this is an ordinary subnet".
-  await assertRejects(
-    () => resolveEngineOperator(agent, subnet, Principal.fromText('um5iw-rqaaa-aaaaq-qaaba-cai')),
-    /could not ask/i,
-    'registry without the method',
-  )
 })
 
 group('canister discovery')

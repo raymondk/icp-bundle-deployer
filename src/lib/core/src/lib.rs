@@ -3,35 +3,38 @@
 //! This is the deployment core of the library in `src/lib`, compiled to
 //! WebAssembly. It reads a bundle, holds it to the rules a bundle has to follow,
 //! and then deploys it through `icp-project` — the same crate icp-cli deploys
-//! with, so a bundle is installed and synced the way the CLI would install and
-//! sync it, not the way a reimplementation guessed.
+//! with, running the same `deploy` operation `icp deploy` runs, so a bundle is
+//! created, installed and synced the way the CLI would do it, not the way a
+//! reimplementation guessed.
 //!
 //! Everything that needs the network or a component runtime is the host's:
-//! signing calls, creating canisters, running sync plugins. See [`host`].
+//! signing calls, running sync plugins, waiting on the clock. See [`host`].
 //!
-//! Reading and checking a bundle needs none of that, so those modules build for
-//! any target and are tested with `cargo test`. The rest talks to JavaScript —
-//! whose values are neither `Send` nor `Sync`, which only holds together on a
-//! single-threaded target — and is compiled for wasm alone.
+//! Reading and checking a bundle needs none of that, and neither does driving
+//! the deploy operation once the seams it runs against are supplied, so those
+//! modules build for any target and are tested with `cargo test`. The rest
+//! talks to JavaScript — whose values are neither `Send` nor `Sync`, which only
+//! holds together on a single-threaded target — and is compiled for wasm alone.
 
 pub mod abi;
 pub mod archive;
 pub mod bundle;
+pub mod deploy;
+pub mod events;
 pub mod files;
+pub mod progress;
 pub mod recipe;
 pub mod sandbox;
-pub mod settings;
+pub mod seams;
 
 #[cfg(target_family = "wasm")]
 mod api;
 #[cfg(target_family = "wasm")]
-mod deploy;
-#[cfg(target_family = "wasm")]
-mod events;
-#[cfg(target_family = "wasm")]
 mod host;
 #[cfg(target_family = "wasm")]
 mod plugin;
+#[cfg(target_family = "wasm")]
+mod runtime;
 
 /// A byte count, for showing how big a wasm is.
 pub fn format_bytes(bytes: usize) -> String {
