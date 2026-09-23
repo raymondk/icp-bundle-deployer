@@ -8,6 +8,18 @@
 
 use serde::Serialize;
 
+/// What a run does to a canister. A name not yet in the id store is created;
+/// one already there is installed into if it is empty and upgraded if a module
+/// is installed — the mode `icp deploy` resolves from the canister's live
+/// status, which the caller read ahead of the run to say which it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Action {
+    Create,
+    Install,
+    Upgrade,
+}
+
 /// What a deployment reports as it goes. This is the whole `DeployEvent` a
 /// caller of the library sees; the library adds nothing of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -20,16 +32,30 @@ pub enum DeployEvent {
     /// Something that concerns the whole deployment: a phase beginning, or a
     /// notice about the run as a whole.
     Phase { message: String },
-    /// A canister is about to be created.
-    Started { name: String },
+    /// Work on a canister begins: it is about to be created, or — for one that
+    /// already exists, whose id is given — installed into or upgraded.
+    Started {
+        name: String,
+        action: Action,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        canister_id: Option<String>,
+    },
     /// A canister exists. Reported the moment its id is known, so a caller that
     /// records ids loses nothing if the run is cut short after this.
-    Created { name: String, canister_id: String },
+    Created {
+        name: String,
+        canister_id: String,
+        action: Action,
+    },
     /// A line about one canister: what is being done to it, or what its sync
     /// plugin printed.
     Progress { name: String, message: String },
     /// A canister's wasm is installed and running.
-    Installed { name: String, canister_id: String },
+    Installed {
+        name: String,
+        canister_id: String,
+        action: Action,
+    },
     /// Something about one canister failed. The run stops after the phase it
     /// was in; the result says what that left behind.
     Failed { name: String, message: String },

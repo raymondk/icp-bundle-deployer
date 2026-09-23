@@ -120,11 +120,19 @@ if (!("Started" in started)) {
 const session_id = started.Started.session_id;
 const [chunk] = callTyped(self, "upload_chunks", { session_id, chunks: [body] });
 const hash = sha256(body);
+// The asset exists already when this canister is being upgraded rather than
+// installed, and creating it again traps; the content is replaced either way.
+try {
+  callTyped(self, "execute_operations", {
+    session_id,
+    is_final: false,
+    operations: [{ CreateAsset: { key: "/index.html", content_type: "text/html", headers: [] } }],
+  });
+} catch (_exists) {}
 callTyped(self, "execute_operations", {
   session_id,
   is_final: true,
   operations: [
-    { CreateAsset: { key: "/index.html", content_type: "text/html", headers: [] } },
     {
       SetAssetContent: {
         key: "/index.html",

@@ -12,16 +12,18 @@ import { Ed25519KeyIdentity } from '@icp-sdk/core/identity'
 import { Principal } from '@icp-sdk/core/principal'
 import { HttpAgent } from '@icp-sdk/core/agent'
 import {
+  canisterStatus,
   createDeployer,
   cyclesBalance,
   resolveSubnet,
   subnetOf,
   type DeployedCanister,
 } from '../src/lib'
+import { planUpgrade, readStatuses } from '../src/app/plan'
+import { upgradeRecorded } from '../src/app/recording'
 import { createRegistry, RegistryError, type ApplicationInput } from '../src/app/registry'
 import { fullstackBundle } from './support/fixtures'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
-import { canisterStatus } from './support/status'
 import { loadModule } from './support/wasm'
 
 await loadModule()
@@ -101,12 +103,12 @@ test('installs the wasm the manifest declared', async () => {
 // handover that sent the manifest's list verbatim would hand the canister away
 // and lock the deployer out of what it just paid for.
 test('leaves the deploying identity in control', async () => {
-  const { controllers } = await canisterStatus(agent, deployed('plain').canisterId)
+  const controllers = (await canisterStatus(agent, deployed('plain').canisterId)).controllers.map((c) => c.toText())
   assert(controllers.includes(principal.toText()), `deployer should be a controller, got ${controllers}`)
 })
 
 test('hands over to the controllers the manifest names', async () => {
-  const { controllers } = await canisterStatus(agent, deployed('plain').canisterId)
+  const controllers = (await canisterStatus(agent, deployed('plain').canisterId)).controllers.map((c) => c.toText())
   const site = deployed('site').canisterId.toText()
   assert(controllers.includes(site), `site should have been added as a controller, got ${controllers}`)
 })
@@ -259,7 +261,10 @@ test('creates an application and stamps it', async () => {
 test('lists newest deployment first', async () => {
   await registry.create(record('blog'))
   await registry.update(record('shop'))
-  const names = (await registry.list()).map((application) => application.name)
+  // The upgrade group below records `fixture` too; only the two made here are ordered.
+  const names = (await registry.list())
+    .map((application) => application.name)
+    .filter((name) => name === 'shop' || name === 'blog')
   assertEqual(names.join(','), 'shop,blog', 'the updated one comes first')
 })
 
@@ -298,6 +303,79 @@ test('refuses an anonymous caller', async () => {
   const anonymous = createRegistry(await HttpAgent.create({ host: HOST, shouldFetchRootKey: true }), registryId)
   await assertRejects(() => anonymous.create(record('anon')), /sign in first/i, 'anonymous create')
   await assertRejects(() => anonymous.list(), /anonymous/i, 'anonymous list')
+})
+
+group('upgrade')
+
+// The fixture deployed a second time, with the first run's canisters recorded
+// under an application: the ids are reused, the modules replaced, the record
+// brought up to date — through the same plan and recorder the page uses.
+const before = {
+  plain: deployed('plain').canisterId,
+  site: deployed('site').canisterId,
+}
+const upgradeEvents: string[] = []
+const firstRecord = await registry.create({
+  ...record('fixture'),
+  canisters: [
+    { name: 'plain', canisterId: before.plain, state: 'deployed' },
+    { name: 'site', canisterId: before.site, state: 'deployed' },
+  ],
+})
+const plan = planUpgrade(firstRecord, bundle, await readStatuses(agent, firstRecord))
+const upgraded = await upgradeRecorded({
+  registry,
+  record: firstRecord,
+  bundle: { sha256: bundle.sha256, fileName: 'e2e-2.icp' },
+  plan,
+  deploy: (recordEvent) =>
+    deployer.deploy(bundle, {
+      existing: plan.existing,
+      onEvent: (event) => {
+        recordEvent(event)
+        if (event.type === 'started' || event.type === 'installed') {
+          upgradeEvents.push(`${event.type}:${event.name}:${event.action}`)
+        }
+        if (event.type === 'failed') console.log(`    ! ${event.message}`)
+      },
+    }),
+})
+
+test('plans an upgrade of every recorded canister', () => {
+  assertEqual(plan.blocked.length, 0, 'both statuses read as their controller')
+  assertEqual(plan.canisters.map((c) => `${c.name}:${c.action}`).join(','), 'plain:upgrade,site:upgrade', 'both installed, both upgraded')
+  assertEqual(plan.orphaned.length, 0, 'the bundle still names both')
+})
+
+test('reuses the recorded canisters instead of creating new ones', () => {
+  assertEqual(upgraded.result.error, undefined, `upgrade failed: ${upgraded.result.error}`)
+  assertEqual(upgraded.result.deployed.length, 2, 'both canisters deployed')
+  const after = Object.fromEntries(upgraded.result.deployed.map((c) => [c.name, c.canisterId.toText()]))
+  assertEqual(after.plain, before.plain.toText(), 'plain keeps its id')
+  assertEqual(after.site, before.site.toText(), 'site keeps its id')
+})
+
+test('says it is upgrading, not creating', () => {
+  assert(upgradeEvents.includes('started:plain:upgrade'), `got ${upgradeEvents.join(' ')}`)
+  assert(upgradeEvents.includes('installed:site:upgrade'), `got ${upgradeEvents.join(' ')}`)
+  assert(!upgradeEvents.some((e) => e.endsWith(':create')), 'nothing was created')
+})
+
+test('leaves both modules installed and the site serving', async () => {
+  for (const name of ['plain', 'site'] as const) {
+    const { moduleHash } = await canisterStatus(agent, before[name])
+    assert(moduleHash !== undefined, `${name} has a module after the upgrade`)
+  }
+  const response = await fetch(gatewayUrl(before.site))
+  assertEqual(response.status, 200, 'the synced site still serves')
+})
+
+test('brings the record up to date', async () => {
+  const stored = (await registry.get('fixture'))!
+  assertEqual(stored.bundleFileName, 'e2e-2.icp', 'the new bundle is recorded')
+  assertEqual(stored.canisters.map((c) => `${c.name}:${c.state}`).join(','), 'plain:deployed,site:deployed', 'states')
+  assert(stored.updated.getTime() > firstRecord.updated.getTime(), 'updated moved forward')
+  assertEqual(stored.created.getTime(), firstRecord.created.getTime(), 'created is kept')
 })
 
 function gatewayUrl(canisterId: Principal): string {

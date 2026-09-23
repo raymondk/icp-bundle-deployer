@@ -45,7 +45,7 @@ use icp_project::{
 
 use crate::{
     bundle::LoadedBundle,
-    events::{DeployEvent, DeployResult, DeployedCanister},
+    events::{Action, DeployEvent, DeployResult, DeployedCanister},
     progress::{Sink, Translator},
     seams::{Artifacts, BundleNetwork, BundleProject, BundleWasm, IdStore, PrebuiltBuild},
 };
@@ -78,11 +78,30 @@ pub struct Options {
     /// under. Empty for an install; for an upgrade, the ids recorded under the
     /// application. A name in here is not created, and is installed in the
     /// mode its live status calls for.
-    pub existing: IdMapping,
+    pub existing: BTreeMap<String, Existing>,
     /// Where the network is reached, as the host knows it. Asked for up front:
     /// a sync plugin is told this, and a host that cannot say should fail the
     /// run before it has created anything.
     pub network: NetworkUrls,
+}
+
+/// A canister that exists before the run, as the caller found it. Whether a
+/// module is installed decides how the run reports what it does to the
+/// canister; the operation itself reads the live status again.
+#[derive(Clone, Copy, Debug)]
+pub struct Existing {
+    pub canister_id: Principal,
+    pub installed: bool,
+}
+
+impl Existing {
+    fn action(self) -> Action {
+        if self.installed {
+            Action::Upgrade
+        } else {
+            Action::Install
+        }
+    }
 }
 
 /// Deploy every canister the environment declares.
@@ -121,16 +140,35 @@ pub async fn deploy(
         }
     }
 
+    // What the run does to the canisters that already exist, said up front and
+    // in the environment's order: they are not created, so nothing else would
+    // announce them before their install.
+    let mut actions = BTreeMap::new();
+    let mut seed = IdMapping::new();
+    for name in env.canisters.keys() {
+        let Some(existing) = options.existing.get(name) else {
+            continue;
+        };
+        actions.insert(name.clone(), existing.action());
+        seed.insert(name.clone(), existing.canister_id);
+        sink(DeployEvent::Started {
+            name: name.clone(),
+            action: existing.action(),
+            canister_id: Some(existing.canister_id.to_text()),
+        });
+    }
+
     // The store is where an id lands the moment a canister exists, so it is
     // what reports the canister — before anything that could still fail.
     let ids = Arc::new(IdStore::new(
-        options.existing,
+        seed,
         Box::new({
             let sink = sink.clone();
             move |name, canister_id| {
                 sink(DeployEvent::Created {
                     name: name.to_owned(),
                     canister_id: canister_id.to_text(),
+                    action: Action::Create,
                 })
             }
         }),
@@ -185,7 +223,7 @@ pub async fn deploy(
         .iter()
         .map(|summary| (summary.name.clone(), summary.wasm_size))
         .collect();
-    let mut translator = Translator::new(sink, wasm_sizes);
+    let mut translator = Translator::new(sink, wasm_sizes, actions);
     let mut report = DeployReport::default();
 
     // The operation reports on a channel; the translator reads it as the run

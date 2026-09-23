@@ -13,12 +13,12 @@
  */
 
 import type { DeployEvent, DeployResult } from '../lib'
+import type { UpgradePlan } from './plan'
 import {
   isValidApplicationName,
   type Application,
   type ApplicationCanister,
   type ApplicationInput,
-  type CanisterState,
   type Registry,
 } from './registry'
 
@@ -72,8 +72,61 @@ export async function deployRecorded({
   deploy,
 }: RecordedDeployment): Promise<Recorded> {
   await registry.create({ ...application, canisters: [] })
+  return recordRun({ registry, application, canisters: [], deploy })
+}
 
-  const canisters: ApplicationCanister[] = []
+export interface RecordedUpgrade {
+  registry: Registry
+  /** The application as recorded, whose name and canisters the run reuses. */
+  record: Application
+  /** The new bundle's identity, which replaces the record's. */
+  bundle: { sha256: string; fileName: string }
+  plan: UpgradePlan
+  deploy: RecordedDeployment['deploy']
+}
+
+/**
+ * Runs an upgrade and keeps the record up to date with it: the bundle's
+ * identity replaced, the canisters the plan orphans flagged as such, every
+ * canister the run creates added as it exists, and every state refreshed when
+ * the run settles. A canister the run did not reach keeps the state it had.
+ */
+export async function upgradeRecorded({
+  registry,
+  record,
+  bundle,
+  plan,
+  deploy,
+}: RecordedUpgrade): Promise<Recorded> {
+  const orphaned = new Set(plan.orphaned.map((canister) => canister.name))
+  const canisters = record.canisters.map((canister) => ({
+    ...canister,
+    state: orphaned.has(canister.name) ? ('orphaned' as const) : canister.state,
+  }))
+  return recordRun({
+    registry,
+    application: { name: record.name, bundleSha256: bundle.sha256, bundleFileName: bundle.fileName },
+    canisters,
+    deploy,
+  })
+}
+
+/**
+ * The part an install and an upgrade share: one update per canister the run
+ * creates, and one when the run settles. `canisters` is what the record holds
+ * going in; what the run creates is added to it.
+ */
+async function recordRun({
+  registry,
+  application,
+  canisters,
+  deploy,
+}: {
+  registry: Registry
+  application: Omit<ApplicationInput, 'canisters'>
+  canisters: ApplicationCanister[]
+  deploy: RecordedDeployment['deploy']
+}): Promise<Recorded> {
   let recorded: Application | undefined
   let recordingError: string | undefined
 
@@ -93,8 +146,10 @@ export async function deployRecorded({
     return queue
   }
 
+  const created = new Set<string>()
   const onEvent = (event: DeployEvent): void => {
     if (event.type !== 'created') return
+    created.add(event.name)
     canisters.push({ name: event.name, canisterId: event.canisterId, state: 'unfinished' })
     void record()
   }
@@ -109,15 +164,20 @@ export async function deployRecorded({
     throw error
   }
 
-  const states = new Map<string, CanisterState>()
-  for (const canister of result.deployed) states.set(canister.name, 'deployed')
-  for (const canister of result.incomplete) states.set(canister.name, 'unfinished')
-  for (const canister of canisters) canister.state = states.get(canister.name) ?? 'unfinished'
-  // A canister the result lists but no event announced — one that existed
-  // before the run, say — is recorded from the result.
+  // What the run finished is deployed and what it left behind is unfinished;
+  // a canister it never reached — an existing one, when the run failed before
+  // its phase — keeps the state it had.
+  const finished = new Set(result.deployed.map((canister) => canister.name))
+  const left = new Set(result.incomplete.map((canister) => canister.name))
+  for (const canister of canisters) {
+    if (finished.has(canister.name)) canister.state = 'deployed'
+    else if (left.has(canister.name) || created.has(canister.name)) canister.state = 'unfinished'
+  }
+  // A canister the result lists but the record did not know — one no event
+  // announced — is recorded from the result.
   for (const canister of [...result.deployed, ...result.incomplete]) {
     if (!canisters.some((known) => known.name === canister.name)) {
-      canisters.push({ ...canister, state: states.get(canister.name)! })
+      canisters.push({ ...canister, state: finished.has(canister.name) ? 'deployed' : 'unfinished' })
     }
   }
   await record()
