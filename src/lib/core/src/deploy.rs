@@ -9,10 +9,16 @@
 //! and running. Interleaving the two would have the first canister's plugin
 //! calling one that is still empty.
 //!
-//! `icp-project`'s own `deploy` is built for a project on disk — it builds, it
-//! keeps an id store, it reports through a task tree — so the phases are driven
-//! here instead, out of the same crate's operations: the same environment
-//! variables, the same install, the same syncer.
+//! `icp-project`'s own `deploy` runs these same phases in this same order. The
+//! phases are nonetheless driven here, out of the crate's individual
+//! operations — the same environment variables, the same install, the same
+//! syncer — for a historical reason: this module was written against a branch
+//! whose `deploy` installed and synced each canister together and was shaped
+//! around a project on disk, and the orchestration was kept when the crate
+//! moved to `main`. Its `deploy` also takes a `Host` struct with seams this
+//! module does not yet supply (an id store, an artifact store, a builder).
+//! Replacing this module with an adapter over `operations::deploy` is tracked
+//! in <https://github.com/raymondk/icp-bundle-deployer/issues/7>.
 //!
 //! The bundle is validated and hashed before any of this runs, so a failure here
 //! means the network refused something. When that happens the run stops and

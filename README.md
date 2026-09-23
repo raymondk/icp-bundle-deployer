@@ -108,11 +108,14 @@ await initialize(await readFile('src/lib/wasm/deployer_bg.wasm'))
 Those are phases, not a per-canister loop, and the order matters: every canister is created
 before any wasm is installed, and every wasm is installed before any sync runs. The second
 separation is there because a sync plugin may call the canisters its step lists, and one
-that ran between installs would be calling a canister with nothing in it yet.
-`icp-project`'s own deploy installs and syncs a canister together, so this is the one place
-the deployer drives its pieces rather than its whole. If a phase fails the run stops and the
-page reports which canisters exist but are unfinished, so nothing is silently abandoned —
-they exist and you control them.
+that ran between installs would be calling a canister with nothing in it yet. `icp deploy`
+runs the same phases in the same order. The deployer currently drives them itself, out of
+`icp-project`'s individual operations, for historical reasons: it was written against a
+branch whose deploy was shaped around a project on disk. Switching to `icp-project`'s own
+`deploy` operation is tracked in
+[#7](https://github.com/raymondk/icp-bundle-deployer/issues/7). If a phase fails the run
+stops and the page reports which canisters exist but are unfinished, so nothing is silently
+abandoned — they exist and you control them.
 
 ## Choosing a subnet
 
