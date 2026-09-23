@@ -20,7 +20,8 @@ import {
 } from '../lib'
 import { restoreSession, signInWithInternetIdentity, signOut, useTemporaryIdentity, type Session } from './auth'
 import { createAgent, describeNetwork, type Network } from './network'
-import { deployRecorded, proposeApplicationName } from './recording'
+import { planUpgrade, readStatuses, type UpgradePlan } from './plan'
+import { deployRecorded, proposeApplicationName, upgradeRecorded } from './recording'
 import { createRegistry, isValidApplicationName, RegistryError, type Application } from './registry'
 
 interface State {
@@ -37,6 +38,11 @@ interface State {
   result?: DeployResult
   /** The application the last result was recorded under. */
   resultApplication?: string
+  /** The application being upgraded, while the drop panel is bound to one. */
+  upgrading?: Application
+  /** What the dropped bundle will do to the application being upgraded. */
+  plan?: UpgradePlan
+  planError?: string
 }
 
 const SKELETON = `
@@ -52,6 +58,10 @@ const SKELETON = `
   <section class="panel" id="applications-panel" hidden></section>
 
   <section class="panel">
+    <p class="banner" id="upgrade-banner" hidden>
+      Upgrading <strong id="upgrade-name"></strong>: drop the new version of its bundle.
+      <a href="#" id="cancel-upgrade">Cancel</a>
+    </p>
     <div class="dropzone" id="dropzone" tabindex="0" role="button">
       <strong>Drop an application bundle here</strong>
       <span class="hint">or click to choose a <code>.icp</code> file</span>
@@ -95,6 +105,10 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const deployButton = select<HTMLButtonElement>(root, '#deploy')
   const subnetInput = select<HTMLInputElement>(root, '#subnet')
   const nameInput = select<HTMLInputElement>(root, '#application-name')
+  const nameField = nameInput.closest<HTMLElement>('.field')!
+  const subnetField = subnetInput.closest<HTMLElement>('.field')!
+  const upgradeBanner = select<HTMLElement>(root, '#upgrade-banner')
+  const upgradeName = select<HTMLElement>(root, '#upgrade-name')
   const log = select<HTMLOListElement>(root, '#log')
 
   function renderIdentity(): void {
@@ -240,8 +254,108 @@ export function mountApp(root: HTMLElement, network: Network): void {
           <p class="muted">From <code>${escapeHtml(application.bundleFileName)}</code>,
             first deployed ${escapeHtml(application.created.toLocaleString())}.</p>
           ${canisters}
+          <div class="actions">
+            <button class="upgrade" data-application="${escapeHtml(application.name)}">Upgrade</button>
+          </div>
         </details>
       </li>`
+  }
+
+  /** Binds the drop panel to an application: its next bundle upgrades it. */
+  function startUpgrade(application: Application): void {
+    state.upgrading = application
+    state.plan = undefined
+    state.planError = undefined
+    state.bundle?.dispose()
+    state.bundle = undefined
+    state.bundleError = undefined
+    state.result = undefined
+    state.resultApplication = undefined
+    log.replaceChildren()
+    renderUpgradeMode()
+    renderBundle()
+    renderResult()
+    renderDeployButton()
+    dropzone.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
+
+  function cancelUpgrade(): void {
+    state.upgrading = undefined
+    state.plan = undefined
+    state.planError = undefined
+    renderUpgradeMode()
+    renderBundle()
+    renderDeployButton()
+  }
+
+  /**
+   * In upgrade mode the name is the application's and the subnet is decided
+   * by the canisters that already exist, so neither field applies.
+   */
+  function renderUpgradeMode(): void {
+    const upgrading = state.upgrading
+    upgradeBanner.hidden = !upgrading
+    upgradeName.textContent = upgrading?.name ?? ''
+    nameField.hidden = Boolean(upgrading)
+    subnetField.hidden = Boolean(upgrading)
+  }
+
+  /**
+   * The pre-flight: read every recorded canister's status, then say what the
+   * dropped bundle will do to each. Nothing is created here.
+   */
+  async function planFor(bundle: Bundle, application: Application): Promise<void> {
+    const { agent } = state
+    if (!agent) return
+    try {
+      const statuses = await readStatuses(agent, application)
+      // The bundle may have been replaced or the upgrade cancelled meanwhile.
+      if (state.bundle !== bundle || state.upgrading !== application) return
+      state.plan = planUpgrade(application, bundle, statuses)
+    } catch (error) {
+      if (state.bundle !== bundle) return
+      state.planError = error instanceof Error ? error.message : String(error)
+    }
+    renderBundle()
+    renderDeployButton()
+  }
+
+  function renderPlan(plan: UpgradePlan, application: Application): string {
+    const badge = (text: string, kind = '') => `<span class="badge ${kind}">${escapeHtml(text)}</span>`
+    const rows = [
+      ...plan.canisters.map(
+        (canister) => `
+        <tr>
+          <td><strong>${escapeHtml(canister.name)}</strong></td>
+          <td>${badge(canister.action, canister.action === 'create' ? 'ok' : '')}</td>
+          <td>${canister.canisterId ? `<code>${escapeHtml(canister.canisterId.toText())}</code>` : '<span class="muted">new</span>'}</td>
+        </tr>`,
+      ),
+      ...plan.orphaned.map(
+        (canister) => `
+        <tr>
+          <td><strong>${escapeHtml(canister.name)}</strong></td>
+          <td>${badge('orphaned', 'warn')}</td>
+          <td><code>${escapeHtml(canister.canisterId.toText())}</code> <span class="muted">— no longer in the bundle; left alone</span></td>
+        </tr>`,
+      ),
+    ].join('')
+
+    const blocked =
+      plan.blocked.length === 0
+        ? ''
+        : `<p class="error">The upgrade cannot go ahead: ${plan.blocked
+            .map((canister) => `${escapeHtml(canister.name)} (${escapeHtml(canister.canisterId.toText())}) — ${escapeHtml(canister.reason)}`)
+            .join('; ')}. Nothing was created.</p>`
+
+    return `
+      <p class="loaded">Upgrading <strong>${escapeHtml(application.name)}</strong> with
+        <strong>${escapeHtml(state.bundle?.fileName ?? 'bundle')}</strong>:</p>
+      <table class="canisters">
+        <thead><tr><th>Canister</th><th>Action</th><th>Id</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${blocked}`
   }
 
   function renderBundle(): void {
@@ -251,6 +365,17 @@ export function mountApp(root: HTMLElement, network: Network): void {
     }
     if (!state.bundle) {
       bundlePanel.innerHTML = ''
+      return
+    }
+
+    if (state.upgrading) {
+      if (state.planError) {
+        bundlePanel.innerHTML = `<p class="error">${escapeHtml(state.planError)}</p>`
+      } else if (!state.plan) {
+        bundlePanel.innerHTML = `<p class="muted">Checking the application's canisters…</p>`
+      } else {
+        bundlePanel.innerHTML = renderPlan(state.plan, state.upgrading)
+      }
       return
     }
 
@@ -305,8 +430,11 @@ export function mountApp(root: HTMLElement, network: Network): void {
     const name = nameInput.value
     const validName = isValidApplicationName(name)
     nameInput.classList.toggle('invalid', name !== '' && !validName)
-    deployButton.disabled = state.busy || !state.bundle || !state.agent || !validName
-    deployButton.textContent = state.busy ? 'Working…' : 'Deploy'
+    const ready = state.upgrading
+      ? state.plan !== undefined && state.plan.blocked.length === 0
+      : validName
+    deployButton.disabled = state.busy || !state.bundle || !state.agent || !ready
+    deployButton.textContent = state.busy ? 'Working…' : state.upgrading ? 'Confirm upgrade' : 'Deploy'
   }
 
   function renderResult(): void {
@@ -391,8 +519,11 @@ export function mountApp(root: HTMLElement, network: Network): void {
     // The file name is the best guess at what the application is called; the
     // user can still say otherwise.
     nameInput.value = proposeApplicationName(state.bundle?.fileName)
+    state.plan = undefined
+    state.planError = undefined
     renderBundle()
     renderDeployButton()
+    if (state.bundle && state.upgrading) void planFor(state.bundle, state.upgrading)
   }
 
   function onDeployEvent(event: DeployEvent): void {
@@ -401,7 +532,9 @@ export function mountApp(root: HTMLElement, network: Network): void {
         appendLog(event.message)
         break
       case 'started':
-        appendLog(`${event.name}: creating canister…`)
+        if (event.action === 'create') appendLog(`${event.name}: creating canister…`)
+        else if (event.action === 'upgrade') appendLog(`Upgrading ${event.name} (${event.canisterId?.toText()})`)
+        else appendLog(`Installing into the empty canister ${event.name} (${event.canisterId?.toText()})`)
         break
       case 'created':
         appendLog(`${event.name}: created ${event.canisterId.toText()}`)
@@ -410,7 +543,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
         appendLog(`${event.name}: ${event.message}`)
         break
       case 'installed':
-        appendLog(`${event.name}: installed`, 'done')
+        appendLog(`${event.name}: ${event.action === 'upgrade' ? 'upgraded' : 'installed'}`, 'done')
         break
       case 'failed':
         appendLog(event.message, 'error')
@@ -442,13 +575,24 @@ export function mountApp(root: HTMLElement, network: Network): void {
   })
 
   nameInput.addEventListener('input', renderDeployButton)
+  applicationsPanel.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button.upgrade')
+    if (!button || state.busy) return
+    const application = state.applications?.find((a) => a.name === button.dataset.application)
+    if (application) startUpgrade(application)
+  })
+  select<HTMLAnchorElement>(root, '#cancel-upgrade').addEventListener('click', (event) => {
+    event.preventDefault()
+    if (!state.busy) cancelUpgrade()
+  })
 
   deployButton.addEventListener('click', () => {
-    const { bundle, agent, session, network } = state
+    const { bundle, agent, session, network, upgrading, plan } = state
     if (!bundle || !agent || !session) return
 
-    const name = nameInput.value
-    if (!isValidApplicationName(name)) return
+    const name = upgrading ? upgrading.name : nameInput.value
+    if (!upgrading && !isValidApplicationName(name)) return
+    if (upgrading && (!plan || plan.blocked.length > 0)) return
     if (!network.registry) {
       log.replaceChildren()
       appendLog(
@@ -481,18 +625,38 @@ export function mountApp(root: HTMLElement, network: Network): void {
       // application can be upgraded instead.
       let recorded
       try {
-        recorded = await deployRecorded({
-          registry,
-          application: { name, bundleSha256: bundle.sha256, bundleFileName: bundle.fileName ?? '' },
-          deploy: (record) =>
-            deployer.deploy(bundle, {
-              subnet,
-              onEvent: (event) => {
-                record(event)
-                onDeployEvent(event)
-              },
-            }),
-        })
+        if (upgrading && plan) {
+          // The canisters the plan reuses are handed to the deployer, which
+          // upgrades or installs into them and creates the rest beside them.
+          recorded = await upgradeRecorded({
+            registry,
+            record: upgrading,
+            bundle: { sha256: bundle.sha256, fileName: bundle.fileName ?? '' },
+            plan,
+            deploy: (record) =>
+              deployer.deploy(bundle, {
+                existing: plan.existing,
+                onEvent: (event) => {
+                  record(event)
+                  onDeployEvent(event)
+                },
+              }),
+          })
+          cancelUpgrade()
+        } else {
+          recorded = await deployRecorded({
+            registry,
+            application: { name, bundleSha256: bundle.sha256, bundleFileName: bundle.fileName ?? '' },
+            deploy: (record) =>
+              deployer.deploy(bundle, {
+                subnet,
+                onEvent: (event) => {
+                  record(event)
+                  onDeployEvent(event)
+                },
+              }),
+          })
+        }
       } catch (error) {
         if (error instanceof RegistryError) {
           appendLog(error.message, 'error')

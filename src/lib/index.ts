@@ -22,12 +22,12 @@
  */
 
 export { createDeployer, DEFAULT_CREATION_CYCLES } from './deployer'
-export type { Deployer, DeployerOptions, DeployOptions } from './deployer'
+export type { Deployer, DeployerOptions, DeployOptions, ExistingCanister } from './deployer'
 
 export { loadBundle, isBundle, Bundle } from './bundle'
 export type { BundleSource, BundleCanister } from './bundle'
 
-export type { DeployEvent, DeployResult, DeployedCanister } from './events'
+export type { DeployAction, DeployEvent, DeployResult, DeployedCanister } from './events'
 
 // Loading the module is automatic; this is only needed where it cannot be
 // fetched from alongside the library, such as a plain Node process.
@@ -41,5 +41,7 @@ export { SyncError, TranspileError, SandboxError } from './plugin'
 export { sha256Hex, formatBytes } from './format'
 export { cyclesBalance, formatCycles, CYCLES_LEDGER_CANISTER_ID } from './ic/cycles-ledger'
 export { resolveSubnet, subnetOf, CYCLES_MINTING_CANISTER_ID } from './ic/subnet'
+export { canisterStatus } from './ic/status'
+export type { CanisterStatus, CanisterRunState } from './ic/status'
 export { isMainnetRootKey } from './ic/root-key'
 export { supportsJspi } from './plugin'

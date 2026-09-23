@@ -21,19 +21,19 @@ use ic_management_canister_types::{
 };
 use icp_bundle_deployer_core::{
     bundle::load_bundle,
-    deploy::{DEFAULT_CYCLES, Options, Runtime, deploy},
-    events::{DeployEvent, DeployResult},
+    deploy::{DEFAULT_CYCLES, Existing, Options, Runtime, deploy},
+    events::{Action, DeployEvent, DeployResult},
 };
 use icp_project::{
     calls::{Authority, Call, CallError, CanisterCalls},
     canister::sync::UnimplementedMockSyncer,
     network::NetworkUrls,
     random::FirstChoice,
-    store_id::IdMapping,
     timer::Immediate,
 };
 use indoc::formatdoc;
 use snafu::Snafu;
+use std::collections::BTreeMap;
 use support::{file, tar};
 
 const WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -218,6 +218,7 @@ fn bundle() -> Vec<u8> {
 /// Deploys the bundle to `network` with `app` already in the id store, and
 /// returns the result with every event the run reported.
 fn deploy_existing(network: Arc<Network>) -> (DeployResult, Vec<DeployEvent>) {
+    let installed = network.module_hash.is_some();
     let bundle = block_on(load_bundle(&bundle())).expect("the bundle is well-formed");
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::new({
@@ -237,7 +238,13 @@ fn deploy_existing(network: Arc<Network>) -> (DeployResult, Vec<DeployEvent>) {
             environment: "local".to_owned(),
             subnet: None,
             cycles: DEFAULT_CYCLES,
-            existing: IdMapping::from([("app".to_owned(), existing_id())]),
+            existing: BTreeMap::from([(
+                "app".to_owned(),
+                Existing {
+                    canister_id: existing_id(),
+                    installed,
+                },
+            )]),
             network: NetworkUrls {
                 api_url: "http://127.0.0.1:8000/".parse().unwrap(),
                 http_gateway_url: None,
@@ -278,18 +285,29 @@ fn a_canister_in_the_id_store_is_upgraded_rather_than_created() {
         "a canister with a module installed is upgraded"
     );
 
-    // No `started`/`created` for a canister that already existed; the run
-    // reports the canister once it is installed, under the id it already had.
+    // No `created` for a canister that already existed. It is announced as
+    // being upgraded, under the id it already had, and reported the same way
+    // once it is installed — what the page's log says is what happens.
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, DeployEvent::Started { .. } | DeployEvent::Created { .. })),
+            .any(|e| matches!(e, DeployEvent::Created { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        events[0],
+        DeployEvent::Started {
+            name: "app".to_owned(),
+            action: Action::Upgrade,
+            canister_id: Some(existing_id().to_text()),
+        },
         "{events:?}"
     );
     assert!(
         events.contains(&DeployEvent::Installed {
             name: "app".to_owned(),
             canister_id: existing_id().to_text(),
+            action: Action::Upgrade,
         }),
         "{events:?}"
     );
@@ -307,7 +325,7 @@ fn a_canister_in_the_id_store_is_upgraded_rather_than_created() {
 #[test]
 fn an_empty_canister_in_the_id_store_is_installed() {
     let network = Network::new(None);
-    let (result, _) = deploy_existing(Arc::clone(&network));
+    let (result, events) = deploy_existing(Arc::clone(&network));
 
     assert_eq!(result.error, None, "{result:?}");
     assert!(!network.methods().iter().any(|m| m == "create_canister"));
@@ -315,4 +333,12 @@ fn an_empty_canister_in_the_id_store_is_installed() {
         network.install_mode(),
         CanisterInstallMode::Install
     ));
+    assert!(
+        events.contains(&DeployEvent::Installed {
+            name: "app".to_owned(),
+            canister_id: existing_id().to_text(),
+            action: Action::Install,
+        }),
+        "{events:?}"
+    );
 }

@@ -21,8 +21,9 @@ import {
   sha256Hex,
 } from '../src/lib'
 import { Principal } from '@icp-sdk/core/principal'
-import { deployRecorded, proposeApplicationName } from '../src/app/recording'
-import { RegistryError, type ApplicationInput, type Registry } from '../src/app/registry'
+import { planUpgrade, type StatusReading } from '../src/app/plan'
+import { deployRecorded, proposeApplicationName, upgradeRecorded } from '../src/app/recording'
+import { RegistryError, type Application, type ApplicationInput, type Registry } from '../src/app/registry'
 import type { DeployEvent, DeployResult } from '../src/lib'
 import { assert, assertEqual, assertRejects, group, run, test } from './support/harness'
 import { createTar, gzip, type TarFile } from './support/tar'
@@ -260,10 +261,10 @@ const application = { name: 'shop', bundleSha256: 'ab'.repeat(32), bundleFileNam
 function fakeDeploy(result: DeployResult) {
   return async (record: (event: DeployEvent) => void): Promise<DeployResult> => {
     record({ type: 'phase', message: 'Creating canisters' })
-    record({ type: 'started', name: 'backend' })
-    record({ type: 'created', name: 'backend', canisterId: alpha })
-    record({ type: 'created', name: 'frontend', canisterId: beta })
-    record({ type: 'installed', name: 'backend', canisterId: alpha })
+    record({ type: 'started', name: 'backend', action: 'create' })
+    record({ type: 'created', name: 'backend', canisterId: alpha, action: 'create' })
+    record({ type: 'created', name: 'frontend', canisterId: beta, action: 'create' })
+    record({ type: 'installed', name: 'backend', canisterId: alpha, action: 'create' })
     return result
   }
 }
@@ -335,6 +336,156 @@ test('a record that cannot be updated is reported, not thrown', async () => {
   assertEqual(recorded.result.deployed.length, 2, 'the deployment result is intact')
   assert(recorded.recordingError?.includes('unreachable'), 'and the recording failure is on it')
   assertEqual(recorded.application, undefined, 'nothing was acknowledged')
+})
+
+// ── Upgrading ───────────────────────────────────────────────────────────────
+
+group('upgrade plan')
+
+const gamma = Principal.fromText('rdmx6-jaaaa-aaaaa-aaadq-cai')
+
+/** An application as recorded: three canisters, one of them left unfinished. */
+const recorded: Application = {
+  name: 'shop',
+  bundleSha256: 'ab'.repeat(32),
+  bundleFileName: 'shop-1.0.0.icp',
+  created: new Date(0),
+  updated: new Date(1),
+  canisters: [
+    { name: 'backend', canisterId: alpha, state: 'deployed' },
+    { name: 'frontend', canisterId: beta, state: 'unfinished' },
+    { name: 'worker', canisterId: gamma, state: 'deployed' },
+  ],
+}
+
+const running = (moduleHash?: string): StatusReading => ({
+  status: { moduleHash, status: 'running', controllers: [alpha] },
+})
+
+/** A bundle naming the given canisters, in that order. */
+const naming = (...names: string[]) => ({
+  canisters: names.map((name) => ({ name, wasmPath: `${name}.wasm`, wasmSize: 8, digest: 'ff', syncDirs: [] })),
+})
+
+test('upgrades what is installed, installs into what is empty, creates what is new, orphans the rest', () => {
+  const plan = planUpgrade(
+    recorded,
+    naming('backend', 'frontend', 'search'),
+    new Map([
+      ['backend', running('aa')],
+      ['frontend', running(undefined)],
+      ['worker', running('cc')],
+    ]),
+  )
+  assertEqual(
+    plan.canisters.map((c) => `${c.name}:${c.action}:${c.canisterId?.toText() ?? 'new'}`).join(' '),
+    `backend:upgrade:${alpha.toText()} frontend:install:${beta.toText()} search:create:new`,
+    'one action per canister in the bundle, in its order',
+  )
+  assertEqual(plan.orphaned.map((c) => c.name).join(','), 'worker', 'a recorded canister the bundle dropped is orphaned')
+  assertEqual(plan.blocked.length, 0, 'every status read')
+  assertEqual(Object.keys(plan.existing).join(','), 'backend,frontend', 'the deployer is handed the reused ids')
+  assertEqual(plan.existing.backend?.installed, true, 'and whether each has a module')
+  assertEqual(plan.existing.frontend?.installed, false, 'an empty canister is installed into')
+})
+
+test('is blocked by a recorded canister whose status cannot be read', () => {
+  const plan = planUpgrade(
+    recorded,
+    naming('backend', 'frontend', 'worker'),
+    new Map([
+      ['backend', running('aa')],
+      ['frontend', { error: 'Canister ryjl3-tyaaa-aaaaa-aaaba-cai not found' }],
+      // `worker` was not read at all.
+    ]),
+  )
+  assertEqual(
+    plan.blocked.map((c) => `${c.name}: ${c.reason}`).join(' | '),
+    `frontend: Canister ryjl3-tyaaa-aaaaa-aaaba-cai not found | worker: its status was not read`,
+    'each blocker names the canister and the reason',
+  )
+})
+
+test('upgrades an application with no recorded canisters as a plain install', () => {
+  const plan = planUpgrade({ ...recorded, canisters: [] }, naming('backend'), new Map())
+  assertEqual(plan.canisters.map((c) => c.action).join(','), 'create', 'everything is created')
+  assertEqual(plan.orphaned.length, 0, 'nothing to orphan')
+  assertEqual(Object.keys(plan.existing).length, 0, 'nothing to reuse')
+})
+
+group('recording an upgrade')
+
+test('replaces the bundle, flags orphans, adds what was created and refreshes the states', async () => {
+  const { registry, writes } = fakeRegistry()
+  const plan = planUpgrade(
+    recorded,
+    naming('backend', 'frontend', 'search'),
+    new Map([
+      ['backend', running('aa')],
+      ['frontend', running(undefined)],
+      ['worker', running('cc')],
+    ]),
+  )
+  const delta = Principal.fromText('qoctq-giaaa-aaaaa-aaaea-cai')
+  const outcome = await upgradeRecorded({
+    registry,
+    record: recorded,
+    bundle: { sha256: 'cd'.repeat(32), fileName: 'shop-2.0.0.icp' },
+    plan,
+    deploy: async (record) => {
+      record({ type: 'started', name: 'backend', action: 'upgrade', canisterId: alpha })
+      record({ type: 'started', name: 'search', action: 'create' })
+      record({ type: 'created', name: 'search', canisterId: delta, action: 'create' })
+      return {
+        deployed: [
+          { name: 'backend', canisterId: alpha },
+          { name: 'frontend', canisterId: beta },
+          { name: 'search', canisterId: delta },
+        ],
+        incomplete: [],
+      }
+    },
+  })
+
+  const updates = writes.filter((write) => write.method === 'update').map((write) => write.input)
+  assertEqual(writes.some((write) => write.method === 'create'), false, 'an upgrade never reserves a name')
+  assertEqual(updates.length, 2, 'one update for the created canister, one when the run settles')
+  assertEqual(updates[0]!.bundleFileName, 'shop-2.0.0.icp', 'the new bundle replaces the old from the first update')
+  assertEqual(updates[0]!.bundleSha256, 'cd'.repeat(32), 'and its digest')
+  assertEqual(
+    updates[0]!.canisters.map((c) => `${c.name}:${c.state}`).join(','),
+    'backend:deployed,frontend:unfinished,worker:orphaned,search:unfinished',
+    'orphans flagged at once, the new canister added as it exists',
+  )
+  assertEqual(
+    updates[1]!.canisters.map((c) => `${c.name}:${c.state}`).join(','),
+    'backend:deployed,frontend:deployed,worker:orphaned,search:deployed',
+    'the final update carries the result states and keeps the orphan',
+  )
+  assertEqual(updates[1]!.canisters[0]!.canisterId.toText(), alpha.toText(), 'ids are unchanged')
+  assertEqual(outcome.result.deployed.length, 3, 'the result comes back as it was')
+})
+
+test('a failed upgrade leaves untouched canisters as they were and created ones unfinished', async () => {
+  const { registry, writes } = fakeRegistry()
+  const plan = planUpgrade(recorded, naming('backend', 'frontend', 'search'), new Map([
+    ['backend', running('aa')],
+    ['frontend', running(undefined)],
+    ['worker', running('cc')],
+  ]))
+  const delta = Principal.fromText('qoctq-giaaa-aaaaa-aaaea-cai')
+  await upgradeRecorded({
+    registry,
+    record: recorded,
+    bundle: { sha256: 'cd'.repeat(32), fileName: 'shop-2.0.0.icp' },
+    plan,
+    deploy: async (record) => {
+      record({ type: 'created', name: 'search', canisterId: delta, action: 'create' })
+      return { deployed: [], incomplete: [{ name: 'search', canisterId: delta }], error: 'install failed' }
+    },
+  })
+  const final = writes.at(-1)!.input.canisters.map((c) => `${c.name}:${c.state}`).join(',')
+  assertEqual(final, 'backend:deployed,frontend:unfinished,worker:orphaned,search:unfinished', 'states after a failed run')
 })
 
 // ── Disposal ────────────────────────────────────────────────────────────────

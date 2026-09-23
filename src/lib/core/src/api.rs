@@ -4,18 +4,18 @@
 //! hands back plain objects and strings, so the library above can present its
 //! own types without any of this showing through.
 
-use std::{rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
 use candid::Principal;
-use icp_project::{canister::sync::Syncer, store_id::IdMapping};
+use icp_project::canister::sync::Syncer;
 use js_sys::{Function, Promise};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::{
     bundle::{self, BundleErrorKind, LoadedBundle},
-    deploy::{self, Options, Runtime},
+    deploy::{self, Existing, Options, Runtime},
     events::{DeployResult, Emitter, to_js},
     host::{DeployerHost, Host},
     plugin::JsPluginRunner,
@@ -98,13 +98,38 @@ pub async fn load_bundle(data: Vec<u8>) -> Result<Bundle, JsValue> {
     }
 }
 
-/// Deploy a bundle: create every canister it declares, give each the whole set
-/// of ids, install their wasm, and run any sync plugin the bundle carries.
+#[wasm_bindgen(typescript_custom_section)]
+const EXISTING_CANISTER: &'static str = r#"
+/**
+ * A canister that exists before a deployment, to be upgraded or installed into
+ * rather than created. `installed` says whether a module is on it, which
+ * decides how the run describes what it does to the canister.
+ */
+export interface ExistingCanister {
+  canisterId: string
+  installed: boolean
+}
+"#;
+
+/// An entry of the `existing` map, as the library passes it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingCanister {
+    canister_id: String,
+    installed: bool,
+}
+
+/// Deploy a bundle: create every canister it declares that does not exist yet,
+/// give each the whole set of ids, install or upgrade their wasm, and run any
+/// sync plugin the bundle carries.
 ///
 /// `environment` names the environment the manifest is read for — `ic` or
 /// `local` — which decides which overrides apply and what a sync plugin is told
 /// it is running against. `subnet`, when given, is where every canister is
 /// created; `cycles` is what each is funded with, as a decimal string.
+/// `existing` maps manifest names to canisters that already exist, which are
+/// not created: an upgrade seeds it from the application's record, an install
+/// passes an empty object.
 ///
 /// Resolves rather than rejecting when a deployment fails part-way: the result
 /// carries what was deployed, what was created but left unfinished, and why it
@@ -117,6 +142,7 @@ pub fn deploy_bundle(
     environment: String,
     subnet: Option<String>,
     cycles: String,
+    #[wasm_bindgen(unchecked_param_type = "Record<string, ExistingCanister>")] existing: JsValue,
     on_event: Function,
 ) -> Result<Promise, JsValue> {
     let caller = Principal::from_text(&caller)
@@ -130,6 +156,30 @@ pub fn deploy_bundle(
     let cycles: u128 = cycles
         .parse()
         .map_err(|e| invalid(format!("'{cycles}' is not a number of cycles: {e}")))?;
+    let existing: BTreeMap<String, ExistingCanister> = serde_wasm_bindgen::from_value(existing)
+        .map_err(|e| {
+            invalid(format!(
+                "the existing canisters are not a map of name to canister: {e}"
+            ))
+        })?;
+    let existing = existing
+        .into_iter()
+        .map(|(name, canister)| {
+            let canister_id = Principal::from_text(&canister.canister_id).map_err(|e| {
+                invalid(format!(
+                    "existing canister '{name}' has id '{}', which is not a canister id: {e}",
+                    canister.canister_id
+                ))
+            })?;
+            Ok((
+                name,
+                Existing {
+                    canister_id,
+                    installed: canister.installed,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, JsValue>>()?;
     let bundle = Rc::clone(&bundle.inner);
 
     // A borrow cannot outlive an exported function, so the deployment is handed
@@ -165,7 +215,7 @@ pub fn deploy_bundle(
             environment,
             subnet,
             cycles,
-            existing: IdMapping::new(),
+            existing,
             network,
         };
 

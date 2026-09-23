@@ -41,12 +41,31 @@ export interface DeployerOptions {
   gatewayUrl?: string
 }
 
+/**
+ * A canister that exists before a deployment: an application's recorded
+ * canister, to be upgraded or installed into rather than created. `installed`
+ * is what the caller read off its status, and decides how the run describes
+ * what it does to the canister; the deployment reads the live status again to
+ * decide what it actually does.
+ */
+export interface ExistingCanister {
+  canisterId: Principal | string
+  installed: boolean
+}
+
 export interface DeployOptions {
   /**
    * Put every canister on this subnet, as `icp deploy --subnet` does. Omitted,
-   * one subnet is resolved for the whole bundle so its canisters stay together.
+   * one subnet is resolved for the whole bundle so its canisters stay together —
+   * beside a canister that already exists, when there is one.
    */
   subnet?: Principal | string
+  /**
+   * Canisters that already exist, by manifest name. A name in here is not
+   * created: its canister is upgraded, or installed into if it is empty, and
+   * every other canister is created beside it. Omitted, everything is created.
+   */
+  existing?: Record<string, ExistingCanister>
   /** Progress as it happens: phases, creation, installs, plugin output. */
   onEvent?: (event: DeployEvent) => void
 }
@@ -70,7 +89,7 @@ export function createDeployer({
   return {
     load: (source) => loadBundle(source),
 
-    async deploy(source, { subnet, onEvent = () => {} } = {}) {
+    async deploy(source, { subnet, existing = {}, onEvent = () => {} } = {}) {
       const bundle = await loadBundle(source)
       // A bundle the caller passed in stays theirs to dispose of. One loaded here
       // has no other owner, and holds the whole uncompressed archive.
@@ -88,6 +107,12 @@ export function createDeployer({
           environment ?? environmentOf(agent),
           subnet === undefined ? undefined : toPrincipal(subnet).toText(),
           cycles.toString(),
+          Object.fromEntries(
+            Object.entries(existing).map(([name, canister]) => [
+              name,
+              { canisterId: toPrincipal(canister.canisterId).toText(), installed: canister.installed },
+            ]),
+          ),
           (event: RawEvent) => onEvent(enrich(event)),
         )
 
@@ -102,7 +127,9 @@ export function createDeployer({
 /** The module reports canister ids as text; the library hands back principals. */
 type WithTextIds<Event> = Event extends { canisterId: Principal }
   ? Omit<Event, 'canisterId'> & { canisterId: string }
-  : Event
+  : Event extends { canisterId?: Principal }
+    ? Omit<Event, 'canisterId'> & { canisterId?: string }
+    : Event
 /**
  * An event as the module serializes it. Distributed over the union one member at
  * a time on purpose: `Omit` over a union keeps only the keys its members share,
@@ -116,9 +143,9 @@ type RawResult = {
 }
 
 function enrich(event: RawEvent): DeployEvent {
-  return 'canisterId' in event
-    ? { ...event, canisterId: Principal.fromText(event.canisterId) }
-    : event
+  return 'canisterId' in event && event.canisterId !== undefined
+    ? ({ ...event, canisterId: Principal.fromText(event.canisterId) } as DeployEvent)
+    : (event as DeployEvent)
 }
 
 function enrichResult(result: RawResult): DeployResult {

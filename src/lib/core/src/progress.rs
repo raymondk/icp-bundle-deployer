@@ -21,7 +21,7 @@ use std::{
 use icp_events::{EventKind, TaskId, TaskOutcome};
 use icp_project::operations::task::{Event, Task};
 
-use crate::events::DeployEvent;
+use crate::events::{Action, DeployEvent};
 
 /// Where translated events go.
 pub type Sink = Arc<dyn Fn(DeployEvent) + Send + Sync>;
@@ -41,6 +41,9 @@ pub struct Translator {
     /// The size of each canister's module, for saying how much is about to be
     /// installed and whether it goes up through the chunk store.
     wasm_sizes: BTreeMap<String, usize>,
+    /// What the run does to each canister that already exists. A name not in
+    /// here is created.
+    actions: BTreeMap<String, Action>,
     /// The tasks still running, so a line or an outcome can be attributed to
     /// the canister its task is about.
     tasks: HashMap<TaskId, Task>,
@@ -48,13 +51,22 @@ pub struct Translator {
 }
 
 impl Translator {
-    pub fn new(sink: Sink, wasm_sizes: BTreeMap<String, usize>) -> Self {
+    pub fn new(
+        sink: Sink,
+        wasm_sizes: BTreeMap<String, usize>,
+        actions: BTreeMap<String, Action>,
+    ) -> Self {
         Self {
             sink,
             wasm_sizes,
+            actions,
             tasks: HashMap::new(),
             outcomes: Outcomes::default(),
         }
+    }
+
+    fn action(&self, name: &str) -> Action {
+        self.actions.get(name).copied().unwrap_or(Action::Create)
     }
 
     pub fn outcomes(&self) -> &Outcomes {
@@ -105,10 +117,15 @@ impl Translator {
             }),
             Task::Create(create) => self.emit(DeployEvent::Started {
                 name: create.canister.clone(),
+                action: Action::Create,
+                canister_id: None,
             }),
             Task::Install(install) => self.emit(DeployEvent::Progress {
                 name: install.canister.clone(),
-                message: installing(self.wasm_sizes.get(&install.canister).copied()),
+                message: installing(
+                    self.action(&install.canister),
+                    self.wasm_sizes.get(&install.canister).copied(),
+                ),
             }),
             // A plugin's output is otherwise the first sign its canister is being
             // synced, arriving under a name the log last reported as installed.
@@ -129,9 +146,11 @@ impl Translator {
             TaskOutcome::Succeeded { retained_output } => match task {
                 Task::Install(install) => {
                     self.outcomes.installed.insert(install.canister.clone());
+                    let action = self.action(&install.canister);
                     self.emit(DeployEvent::Installed {
                         name: install.canister,
                         canister_id: install.canister_id.to_text(),
+                        action,
                     });
                 }
                 Task::Sync(sync) => {
@@ -171,17 +190,21 @@ fn is_build_phase(title: &str) -> bool {
 /// What is about to be installed, and how. A wasm over the ingress limit goes up
 /// through the chunk store, which is worth saying because it takes noticeably
 /// longer.
-fn installing(wasm_size: Option<usize>) -> String {
+fn installing(action: Action, wasm_size: Option<usize>) -> String {
     const CHUNK_THRESHOLD: usize = 2 * 1024 * 1024;
 
+    let verb = match action {
+        Action::Create | Action::Install => "Installing",
+        Action::Upgrade => "Upgrading to",
+    };
     let Some(wasm_size) = wasm_size else {
-        return "Installing…".to_owned();
+        return format!("{verb}…");
     };
     let size = crate::format_bytes(wasm_size);
     if wasm_size > CHUNK_THRESHOLD {
-        format!("Installing {size} through the chunk store…")
+        format!("{verb} {size} through the chunk store…")
     } else {
-        format!("Installing {size}…")
+        format!("{verb} {size}…")
     }
 }
 
@@ -252,8 +275,11 @@ mod tests {
             let seen = Arc::clone(&seen);
             move |event| seen.lock().unwrap().push(event)
         });
-        let mut translator =
-            Translator::new(sink, BTreeMap::from([("site".to_owned(), 3 * 1024 * 1024)]));
+        let mut translator = Translator::new(
+            sink,
+            BTreeMap::from([("site".to_owned(), 3 * 1024 * 1024)]),
+            BTreeMap::from([("api".to_owned(), Action::Upgrade)]),
+        );
         let (reporter, mut rx) = channel::<Task>();
         f(&reporter);
         drop(reporter);
@@ -299,10 +325,36 @@ mod tests {
                 DeployEvent::Installed {
                     name: "site".to_owned(),
                     canister_id: cid().to_text(),
+                    action: Action::Create,
                 },
             ]
         );
         assert!(translator.outcomes().installed.contains("site"));
+    }
+
+    /// A canister that already exists is not created, so its install task is
+    /// the first thing said about it, and it says what the run does to it.
+    #[test]
+    fn an_existing_canister_is_reported_with_its_action() {
+        let (events, _) = translate(|reporter| {
+            reporter
+                .task(Task::install("api", cid()))
+                .finish(TaskOutcome::succeeded());
+        });
+        assert_eq!(
+            events,
+            vec![
+                DeployEvent::Progress {
+                    name: "api".to_owned(),
+                    message: "Upgrading to…".to_owned(),
+                },
+                DeployEvent::Installed {
+                    name: "api".to_owned(),
+                    canister_id: cid().to_text(),
+                    action: Action::Upgrade,
+                },
+            ]
+        );
     }
 
     /// A plugin's lines arrive under the canister whose sync task they belong
@@ -354,7 +406,9 @@ mod tests {
                     message: "Creating canisters".to_owned()
                 },
                 DeployEvent::Started {
-                    name: "site".to_owned()
+                    name: "site".to_owned(),
+                    action: Action::Create,
+                    canister_id: None,
                 },
                 DeployEvent::Failed {
                     name: "site".to_owned(),
