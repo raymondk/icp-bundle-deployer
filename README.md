@@ -355,7 +355,7 @@ anonymous caller none — are Motoko unit tests under `test/*.test.mo`, run with
 (`npm test` includes them). The caller and the clock are parameters of the module the
 actor delegates to, which is what lets them run without a replica.
 
-Both suites run in CI on every pull request and on `main`
+Both suites run in CI on every pull request, and on `main` as the gate of a deployment
 ([`.github/workflows/test.yml`](./.github/workflows/test.yml)), after a build of the page,
 with the toolchains at the versions pinned in [`rust-toolchain.toml`](./rust-toolchain.toml),
 [`.nvmrc`](./.nvmrc), [`mops.toml`](./mops.toml) and the workflow itself.
@@ -387,13 +387,34 @@ refusals through the same client module the page uses.
 
 ## Deploying to mainnet
 
+Every push to `main` deploys, through
+[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml): the Test workflow's job
+runs first, then `icp deploy -e ic --no-create -y` upgrades both canisters in place, then the
+job checks that they run, that the frontend serves the `index.html` it just built, and that
+`https://apps.raymondk.co` reaches it with the `ic_env` cookie. The workflow can also be
+started by hand from the Actions tab. Deployments queue rather than interrupt one another.
+
+The canisters' mainnet ids are committed in `.icp/data/mappings/ic.ids.json`, and
+`--no-create` makes a missing entry an error rather than a new canister. The job signs as a
+dedicated **deployer identity**, the canisters' controller, whose PEM is the
+`MAINNET_DEPLOYER_PEM` secret of the repository's `mainnet` environment:
+
+```bash
+icp identity export <name> | gh secret set MAINNET_DEPLOYER_PEM --env mainnet
+```
+
+A change to the registry's Candid interface is not checked for compatibility at deploy time,
+since `-y` answers that prompt too; it is something to look at in review.
+
+The same deployment can be run from a workstation as that identity, or as any other
+controller:
+
 ```bash
 icp deploy -e ic
 ```
 
-Sign in with Internet Identity. Nothing else differs — creation is charged to that
-principal's cycles ledger account exactly as it is locally, so the only thing to check is
-that the balance shown in the identity panel covers 2T per canister.
+Creation, when it happens, is charged to that principal's cycles ledger account exactly as
+it is locally, so the only thing to check is that the balance covers 2T per canister.
 
 ### Custom domain
 
