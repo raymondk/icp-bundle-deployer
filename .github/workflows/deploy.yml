@@ -1,0 +1,70 @@
+# Deploys main to mainnet: the Test workflow's job first, then `icp deploy -e ic`
+# as the deployer identity, then a check on what is live. Also runnable by hand
+# from the Actions tab. The README's "Deploying to mainnet" section describes
+# the identity and the secret this needs.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deployment at a time, never cancelled halfway: a later push waits its turn.
+concurrency:
+  group: deploy-mainnet
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: mainnet
+      url: https://apps.raymondk.co
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+
+      # The deployer identity, from the PEM in the environment's secrets. The
+      # runner has no keyring and is discarded after the job, so the key is kept
+      # in plain text for the minutes it exists.
+      - name: Import the deployer identity
+        env:
+          PEM: ${{ secrets.MAINNET_DEPLOYER_PEM }}
+        run: |
+          umask 077
+          printf '%s\n' "$PEM" > "$RUNNER_TEMP/deployer.pem"
+          icp identity import deployer --from-pem "$RUNNER_TEMP/deployer.pem" --storage plaintext
+          rm "$RUNNER_TEMP/deployer.pem"
+          echo "deploying as $(icp identity principal --identity deployer)"
+
+      # Builds both canisters and upgrades them in place. `--no-create` turns a
+      # canister missing from .icp/data/mappings/ic.ids.json into an error
+      # rather than a new canister; `-y` answers the prompts a job cannot,
+      # including the Candid compatibility check on the registry's interface,
+      # which review of a pull request stands in for.
+      - name: Deploy to mainnet
+        run: icp deploy -e ic --identity deployer --no-create -y
+
+      # The canisters run, the frontend serves the index.html this job built,
+      # and the custom domain reaches it and carries the ic_env cookie the page
+      # needs.
+      - name: Check what is live
+        run: |
+          set -euo pipefail
+          for canister in frontend registry; do
+            icp canister status "$canister" -e ic --identity deployer
+          done
+          id=$(icp canister status frontend -e ic --id-only)
+          served=$(curl -sf --compressed "https://$id.icp0.io/index.html" | sha256sum | cut -d' ' -f1)
+          built=$(sha256sum dist/index.html | cut -d' ' -f1)
+          if [ "$served" != "$built" ]; then
+            echo "the frontend serves index.html $served, not the $built just built"
+            exit 1
+          fi
+          curl -sfI https://apps.raymondk.co/ | grep -qi '^set-cookie: ic_env'
+          echo "https://apps.raymondk.co serves the build"

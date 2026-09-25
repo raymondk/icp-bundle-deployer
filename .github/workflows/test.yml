@@ -1,17 +1,17 @@
-# Builds the project and runs every suite the README describes under "Tests",
-# on each pull request and on main. The toolchains the README lists under
-# "Run it" are installed at pinned versions: Rust's is in rust-toolchain.toml,
-# Node's in .nvmrc, the Motoko compiler's in mops.toml, and the rest here.
+# Builds the project and runs every suite the README describes under "Tests":
+# on each pull request, and on main as the first job of the Deploy workflow,
+# which calls this one.
 name: Test
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_call:
 
+# A newer push to a pull request supersedes the run in progress. Called from
+# Deploy, runs queue instead, since one may be the gate of a deployment.
 concurrency:
   group: test-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -19,32 +19,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-
-      # Installs mops and caches its packages and the moc toolchain; mops picks
-      # up the compiler version from mops.toml when it first builds. The action
-      # installs its own Node, so it goes before ours to leave ours first on PATH.
-      - uses: dfinity/setup-mops@v1
-        with:
-          mops-version: 3.3.0
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      - name: Install the Rust toolchain rust-toolchain.toml names
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@v2
-
-      # icp-cli and ic-wasm ship as npm wrappers around their binaries, as does
-      # wasm-pack. With no binaryen on the runner, wasm-pack fetches a current
-      # wasm-opt itself.
-      - name: Install icp-cli, ic-wasm and wasm-pack
-        run: npm install -g @icp-sdk/icp-cli@1.5.0 @icp-sdk/ic-wasm@0.11.1 wasm-pack@0.15.0
-
-      - run: npm ci
-      - run: mops install
+      - uses: ./.github/actions/toolchain
 
       # What `icp deploy` builds for the frontend canister.
       - name: Build the page

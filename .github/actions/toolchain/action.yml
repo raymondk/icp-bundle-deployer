@@ -1,0 +1,40 @@
+# Installs what the README lists under "Run it", at the pinned versions: Rust
+# from rust-toolchain.toml, Node from .nvmrc, the Motoko compiler from
+# mops.toml, and the rest here. Then restores the project's dependencies. The
+# Test and Deploy workflows both start from this.
+name: Toolchain
+description: Install the project's toolchains and dependencies
+
+runs:
+  using: composite
+  steps:
+    # Installs mops and caches its packages and the moc toolchain; mops picks
+    # up the compiler version from mops.toml when it first builds. The action
+    # installs its own Node, so it goes before ours to leave ours first on PATH.
+    - uses: dfinity/setup-mops@v1
+      with:
+        mops-version: 3.3.0
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    - name: Install the Rust toolchain rust-toolchain.toml names
+      shell: bash
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+
+    # icp-cli and ic-wasm ship as npm wrappers around their binaries, as does
+    # wasm-pack. With no binaryen on the runner, wasm-pack fetches a current
+    # wasm-opt itself.
+    - name: Install icp-cli, ic-wasm and wasm-pack
+      shell: bash
+      run: npm install -g @icp-sdk/icp-cli@1.5.0 @icp-sdk/ic-wasm@0.11.1 wasm-pack@0.15.0
+
+    - shell: bash
+      run: npm ci
+
+    - shell: bash
+      run: mops install
