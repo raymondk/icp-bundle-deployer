@@ -2,7 +2,9 @@
  * The deployer UI: pick a bundle, sign in, deploy.
  *
  * The DOM skeleton is built once and its regions are updated in place, so the file
- * input and drop target keep their identity across renders.
+ * input and drop target keep their identity across renders. The deploy panel is
+ * part of the skeleton but hidden until a bundle is loaded: the user only has
+ * something to name and place once they have picked one.
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
@@ -70,7 +72,7 @@ const SKELETON = `
     <div id="bundle-panel"></div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="deploy-panel" hidden>
     <label class="field" for="application-name">
       <span>Application name</span>
       <input type="text" id="application-name" spellcheck="false" autocomplete="off"
@@ -102,6 +104,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
   const resultPanel = select<HTMLElement>(root, '#result')
   const dropzone = select<HTMLElement>(root, '#dropzone')
   const fileInput = select<HTMLInputElement>(root, '#file-input')
+  const deployPanel = select<HTMLElement>(root, '#deploy-panel')
   const deployButton = select<HTMLButtonElement>(root, '#deploy')
   const subnetInput = select<HTMLInputElement>(root, '#subnet')
   const nameInput = select<HTMLInputElement>(root, '#application-name')
@@ -275,6 +278,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     renderUpgradeMode()
     renderBundle()
     renderResult()
+    renderDeployPanel()
     renderDeployButton()
     dropzone.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }
@@ -426,6 +430,18 @@ export function mountApp(root: HTMLElement, network: Network): void {
       ${warning}`
   }
 
+  /**
+   * There is nothing to name or place until a bundle is loaded, so the panel
+   * with the fields and the deploy button waits for one. The log and result
+   * live in it too; both are cleared whenever the bundle changes.
+   */
+  function renderDeployPanel(): void {
+    const appeared = deployPanel.hidden && state.bundle !== undefined
+    deployPanel.hidden = !state.bundle
+    // The proposed name is the first thing to check, so put the cursor on it.
+    if (appeared && !state.upgrading) nameInput.focus()
+  }
+
   function renderDeployButton(): void {
     const name = nameInput.value
     const validName = isValidApplicationName(name)
@@ -522,6 +538,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     state.plan = undefined
     state.planError = undefined
     renderBundle()
+    renderDeployPanel()
     renderDeployButton()
     if (state.bundle && state.upgrading) void planFor(state.bundle, state.upgrading)
   }
