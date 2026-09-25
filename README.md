@@ -394,3 +394,30 @@ icp deploy -e ic
 Sign in with Internet Identity. Nothing else differs — creation is charged to that
 principal's cycles ledger account exactly as it is locally, so the only thing to check is
 that the balance shown in the identity panel covers 2T per canister.
+
+### Custom domain
+
+The page is served at **apps.raymondk.co**. The asset canister's side of that is
+[`public/.well-known/ic-domains`](./public/.well-known/ic-domains), which names the domain
+and which the static-site recipe uploads with the rest of the build (`.well-known/` is the
+one dot-directory it does not skip). The gateway's side is DNS plus a one-time registration,
+with `<canister-id>` the frontend's mainnet id:
+
+| Type | Name | Value |
+|---|---|---|
+| CNAME | `apps.raymondk.co` | `apps.raymondk.co.icp1.io` |
+| TXT | `_canister-id.apps.raymondk.co` | `<canister-id>` |
+| CNAME | `_acme-challenge.apps.raymondk.co` | `_acme-challenge.apps.raymondk.co.icp2.io` |
+
+```bash
+curl -sL "https://icp.net/custom-domains/v1/apps.raymondk.co/validate"   # DNS and the file
+curl -sL -X POST "https://icp.net/custom-domains/v1/apps.raymondk.co"    # register once
+curl -sL "https://icp.net/custom-domains/v1/apps.raymondk.co"            # until `registered`
+```
+
+Pointing the domain at a different canister later is a change to the TXT record followed by
+a `PATCH` to the same URL. The DNS provider must not add its own TLS certificate for the
+name, or the ACME challenge fails.
+
+API calls keep going to the page's own origin: the gateway answers `/api/v2` on a custom
+domain as it does on a canister URL.
