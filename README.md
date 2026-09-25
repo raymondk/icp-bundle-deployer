@@ -355,6 +355,11 @@ anonymous caller none — are Motoko unit tests under `test/*.test.mo`, run with
 (`npm test` includes them). The caller and the clock are parameters of the module the
 actor delegates to, which is what lets them run without a replica.
 
+Both suites run in CI on every pull request and on `main`
+([`.github/workflows/test.yml`](./.github/workflows/test.yml)), after a build of the page,
+with the toolchains at the versions pinned in [`rust-toolchain.toml`](./rust-toolchain.toml),
+[`.nvmrc`](./.nvmrc), [`mops.toml`](./mops.toml) and the workflow itself.
+
 The e2e suite needs a running local network (`icp network start -d`). It builds a
 two-canister bundle from the published certified-assets release (cached under
 `.cache/` after the first run), funds a fresh identity with `icp cycles transfer`,
