@@ -5,6 +5,10 @@
  * input and drop target keep their identity across renders. The deploy panel is
  * part of the skeleton but hidden until a bundle is loaded: the user only has
  * something to name and place once they have picked one.
+ *
+ * The page is two columns on a wide viewport: the identity and the list of
+ * applications on one side, the install/upgrade flow on the other, so the list
+ * stays in view while a bundle is being worked on. They stack on a narrow one.
  */
 
 import type { HttpAgent } from '@icp-sdk/core/agent'
@@ -55,10 +59,13 @@ const SKELETON = `
     </p>
   </header>
 
-  <section class="panel" id="identity-panel"></section>
+  <div class="layout">
+  <aside class="sidebar">
+    <section class="panel" id="identity-panel"></section>
+    <section class="panel" id="applications-panel"></section>
+  </aside>
 
-  <section class="panel" id="applications-panel" hidden></section>
-
+  <main class="flow">
   <section class="panel">
     <p class="banner" id="upgrade-banner" hidden>
       Upgrading <strong id="upgrade-name"></strong>: drop the new version of its bundle.
@@ -91,6 +98,8 @@ const SKELETON = `
     <ol class="log" id="log"></ol>
     <div id="result"></div>
   </section>
+  </main>
+  </div>
 `
 
 export function mountApp(root: HTMLElement, network: Network): void {
@@ -203,14 +212,12 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
   function renderApplications(): void {
     const { session, network, applications, applicationsError } = state
-    applicationsPanel.hidden = !session
-    if (!session) {
-      applicationsPanel.innerHTML = ''
-      return
-    }
 
     let body: string
-    if (!network.registry) {
+    if (!session) {
+      body = `<p class="muted">The applications you deploy with this page are listed here
+        once you are signed in.</p>`
+    } else if (!network.registry) {
       body = `<p class="muted">This page was served without a registry canister, so the
         applications deployed with it cannot be listed.</p>`
     } else if (applicationsError) {
@@ -247,12 +254,16 @@ export function mountApp(root: HTMLElement, network: Network): void {
             <tbody>${rows}</tbody>
           </table>`
 
+    const count = application.canisters.length
+    const selected = state.upgrading?.name === application.name
     return `
       <li>
-        <details class="application">
+        <details class="application${selected ? ' selected' : ''}" data-application="${escapeHtml(application.name)}">
           <summary>
             <strong>${escapeHtml(application.name)}</strong>
-            <span class="muted">last deployed ${escapeHtml(application.updated.toLocaleString())}</span>
+            <span class="meta muted">${count} canister${count === 1 ? '' : 's'} · last deployed ${escapeHtml(
+              application.updated.toLocaleString(),
+            )}</span>
           </summary>
           <p class="muted">From <code>${escapeHtml(application.bundleFileName)}</code>,
             first deployed ${escapeHtml(application.created.toLocaleString())}.</p>
@@ -262,6 +273,17 @@ export function mountApp(root: HTMLElement, network: Network): void {
           </div>
         </details>
       </li>`
+  }
+
+  /**
+   * Marks the application being upgraded in the list. Toggled in place rather
+   * than by re-rendering the list, which would collapse the entry the user has
+   * open.
+   */
+  function renderSelection(): void {
+    for (const entry of applicationsPanel.querySelectorAll<HTMLElement>('.application')) {
+      entry.classList.toggle('selected', entry.dataset.application === state.upgrading?.name)
+    }
   }
 
   /** Binds the drop panel to an application: its next bundle upgrades it. */
@@ -275,6 +297,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     state.result = undefined
     state.resultApplication = undefined
     log.replaceChildren()
+    renderSelection()
     renderUpgradeMode()
     renderBundle()
     renderResult()
@@ -287,6 +310,7 @@ export function mountApp(root: HTMLElement, network: Network): void {
     state.upgrading = undefined
     state.plan = undefined
     state.planError = undefined
+    renderSelection()
     renderUpgradeMode()
     renderBundle()
     renderDeployButton()

@@ -131,9 +131,13 @@ upstream, the core builds against a branch of a fork that is upstream plus that 
 ## Your applications
 
 Signed in, the page lists the applications you have deployed with it, newest deployment
-first. Each entry opens to the canisters it consists of — the manifest name and the canister
-id — with a badge on any canister that is unfinished or orphaned. The list is per
-principal: signing in as someone else shows their applications, not yours.
+first. The list sits beside the install flow, in a column that stays put while you work on
+a bundle, so it is in view when a deployment lands; on a narrow screen it stacks above the
+drop zone. Each entry shows its name, how many canisters it has and when it was last
+deployed, and opens to the canisters it consists of — the manifest name and the canister
+id — with a badge on any canister that is unfinished or orphaned. The entry being upgraded
+is outlined while the drop panel is bound to it. The list is per principal: signing in as
+someone else shows their applications, not yours.
 
 The records live in a **registry canister** that ships with the page, one per network,
 written in Motoko (`src/registry/`). It is caller-scoped throughout: every method operates
