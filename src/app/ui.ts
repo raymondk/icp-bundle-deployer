@@ -102,10 +102,27 @@ const SKELETON = `
   </div>
 `
 
+/** How long the copy button reports its outcome before going back to normal. */
+const COPIED_NOTICE_MS = 1500
+
+/* Icons are inline so the page has no image requests to make; the button shows
+   the one matching its state. */
+const COPY_ICON =
+  `<svg class="icon-copy" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none" ` +
+  `stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">` +
+  `<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>` +
+  `<path d="M10.5 5.5V3.5A1 1 0 0 0 9.5 2.5H3.5A1 1 0 0 0 2.5 3.5V9.5A1 1 0 0 0 3.5 10.5H5.5"/></svg>`
+const CHECK_ICON =
+  `<svg class="icon-check" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none" ` +
+  `stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">` +
+  `<path d="M3 8.5l3 3 7-7"/></svg>`
+
 export function mountApp(root: HTMLElement, network: Network): void {
   root.innerHTML = SKELETON
 
   const state: State = { network, busy: false }
+  /** The pending reset of the copy button's notice, so a second click extends it. */
+  let copyNotice: number | undefined
 
   const identityPanel = select<HTMLElement>(root, '#identity-panel')
   const applicationsPanel = select<HTMLElement>(root, '#applications-panel')
@@ -129,7 +146,12 @@ export function mountApp(root: HTMLElement, network: Network): void {
 
     if (session) {
       rows.push(
-        row('Identity', `<code>${escapeHtml(session.principal.toText())}</code>`),
+        row(
+          'Identity',
+          `<span class="copyable"><code>${escapeHtml(session.principal.toText())}</code>` +
+            `<button type="button" id="copy-identity" class="icon" title="Copy identity" aria-label="Copy identity">` +
+            `${COPY_ICON}${CHECK_ICON}</button></span>`,
+        ),
         row(
           'Signed in with',
           session.source === 'internet-identity' ? 'Internet Identity' : 'a temporary browser key',
@@ -154,6 +176,23 @@ export function mountApp(root: HTMLElement, network: Network): void {
     })
     identityPanel.querySelector('#use-temporary')?.addEventListener('click', () => {
       void withBusy(async () => establish(useTemporaryIdentity()))
+    })
+    identityPanel.querySelector('#copy-identity')?.addEventListener('click', (event) => {
+      const button = event.currentTarget as HTMLButtonElement
+      const principal = state.session?.principal.toText()
+      if (principal === undefined) return
+      void copyToClipboard(principal).then((copied) => {
+        // Rendering the panel again would reset the notice, so the feedback is a
+        // class on the button that the next render simply drops.
+        button.classList.toggle('copied', copied)
+        button.classList.toggle('failed', !copied)
+        button.title = copied ? 'Copied' : 'Could not copy'
+        window.clearTimeout(copyNotice)
+        copyNotice = window.setTimeout(() => {
+          button.classList.remove('copied', 'failed')
+          button.title = 'Copy identity'
+        }, COPIED_NOTICE_MS)
+      })
     })
     identityPanel.querySelector('#sign-out')?.addEventListener('click', () => {
       void withBusy(async () => {
@@ -742,6 +781,36 @@ function escapeHtml(text: string): string {
     (character) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!,
   )
+}
+
+/**
+ * Puts `text` on the clipboard, reporting whether it got there. The async
+ * clipboard API needs a secure context and permission, so an insecure `http://`
+ * local page falls back to the selection-based command where it still exists.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // Fall through to the legacy path.
+    }
+  }
+  const scratch = document.createElement('textarea')
+  scratch.value = text
+  scratch.setAttribute('readonly', '')
+  scratch.style.position = 'fixed'
+  scratch.style.opacity = '0'
+  document.body.append(scratch)
+  scratch.select()
+  try {
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    scratch.remove()
+  }
 }
 
 function row(label: string, value: string): string {

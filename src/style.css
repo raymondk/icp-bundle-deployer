@@ -152,6 +152,48 @@ button.primary {
   font-size: 0.85em;
 }
 
+/* A value with a copy button beside it. The button is icon-only and swaps the
+   copy glyph for a check mark while it reports that the copy worked. */
+.copyable {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 100%;
+}
+.copyable code {
+  min-width: 0;
+}
+button.icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.2em;
+  line-height: 0;
+  color: var(--muted);
+  background: none;
+  border-color: transparent;
+}
+button.icon:hover:not(:disabled),
+button.icon:focus-visible {
+  color: inherit;
+  border-color: var(--accent);
+  outline: none;
+}
+button.icon .icon-check,
+button.icon.copied .icon-copy {
+  display: none;
+}
+button.icon.copied {
+  color: var(--ok);
+}
+button.icon.copied .icon-check {
+  display: inline;
+}
+button.icon.failed {
+  color: var(--error);
+}
+
 /* Bundle selection */
 
 .dropzone {
