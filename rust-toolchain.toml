@@ -1,0 +1,6 @@
+# The Rust version the core builds with, for developers and CI alike. rustup
+# reads this file, and `rustup toolchain install` with no arguments installs
+# what it names, the wasm32 target included.
+[toolchain]
+channel = "1.98.0"
+targets = ["wasm32-unknown-unknown"]
